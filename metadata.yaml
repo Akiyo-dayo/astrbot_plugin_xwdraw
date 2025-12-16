@@ -1,0 +1,8 @@
+name: astrbot_plugin_xwdraw
+desc: 内置对接远端 SD 图生图/文生图 API（默认 https://sd.loping151.com/api/generate ），指令前缀：小千来点
+help: |
+  小千来点 <提示词> - 使用配置中的远端绘图 API 生成图片
+  配置方法：在插件配置页面填写 `api_key`（Bearer Token）和 `api_url`（可不改）与 `timeout`。
+version: v0.2.0
+author: Akiyo-dayo
+repo: ''

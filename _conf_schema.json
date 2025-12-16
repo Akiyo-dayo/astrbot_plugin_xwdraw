@@ -1,0 +1,20 @@
+{
+    "api_url": {
+        "description": "远端绘图API地址",
+        "type": "string",
+        "hint": "填写完整生成接口地址（例如 https://sd.loping151.com/api/generate）",
+        "default": "https://sd.loping151.com/api/generate"
+    },
+    "api_key": {
+        "description": "API Key（用于 Bearer 认证）",
+        "type": "string",
+        "hint": "填写从绘图服务获取的 API Key（会存储在插件配置中）",
+        "default": ""
+    },
+    "timeout": {
+        "description": "请求超时时间（秒）",
+        "type": "int",
+        "hint": "等待远端生成或下载图片的最大秒数（默认60）",
+        "default": 60
+    }
+}
