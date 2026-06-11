@@ -1,20 +1,86 @@
 {
     "api_url": {
-        "description": "远端绘图API地址",
+        "description": "远端绘图 API 地址",
         "type": "string",
-        "hint": "填写完整生成接口地址（例如 https://sd.loping151.com/api/generate）",
+        "hint": "填写完整生成接口地址，例如 https://sd.loping151.com/api/generate",
         "default": "https://sd.loping151.com/api/generate"
     },
     "api_key": {
-        "description": "API Key（用于 Bearer 认证）",
+        "description": "API Key（Bearer Token）",
         "type": "string",
-        "hint": "填写从绘图服务获取的 API Key（会存储在插件配置中）",
+        "hint": "填写从绘图服务获取的 API Key。请不要把真实 Key 写入仓库。",
         "default": ""
     },
     "timeout": {
         "description": "请求超时时间（秒）",
         "type": "int",
-        "hint": "等待远端生成或下载图片的最大秒数（默认60）",
+        "hint": "等待远端生成、下载图片、下载视频或文档的最大秒数。",
         "default": 60
+    },
+    "r18_review_enabled": {
+        "description": "启用图片发送前自审",
+        "type": "bool",
+        "hint": "开启后，所有生成图片和插件主动发送的图片会在发送前检查 R18/R18G/NSFW 信息。",
+        "default": true
+    },
+    "r18_block_r18": {
+        "description": "拦截 R18 图片",
+        "type": "bool",
+        "hint": "服务 metadata 或外部审核判定为 R18 时不发送图片。",
+        "default": true
+    },
+    "r18_block_r18g": {
+        "description": "拦截 R18G 图片",
+        "type": "bool",
+        "hint": "服务 metadata 或外部审核判定为 R18G 时不发送图片。",
+        "default": true
+    },
+    "r18_nsfw_score_threshold": {
+        "description": "NSFW 分数拦截阈值",
+        "type": "float",
+        "hint": "当 metadata.nsfw_score 大于等于该阈值时拦截。默认 0.65。",
+        "default": 0.65
+    },
+    "r18_allowed_session_ids": {
+        "description": "R18 放行会话列表",
+        "type": "string",
+        "hint": "用英文逗号分隔 unified_msg_origin/session_id。命中的会话会跳过 R18 拦截，默认留空。",
+        "default": ""
+    },
+    "external_review_enabled": {
+        "description": "启用外部图片审核接口",
+        "type": "bool",
+        "hint": "默认关闭。开启后会把生成图 base64 发送到 external_review_api_url，期望返回 safe/r18/r18g/score/reason。",
+        "default": false
+    },
+    "external_review_api_url": {
+        "description": "外部审核 API 地址",
+        "type": "string",
+        "hint": "外部审核接口地址。未配置且启用外部审核时会按失败策略处理。",
+        "default": ""
+    },
+    "external_review_api_key": {
+        "description": "外部审核 API Key",
+        "type": "string",
+        "hint": "可选。配置后会作为 Bearer Token 发送给外部审核接口。",
+        "default": ""
+    },
+    "external_review_model": {
+        "description": "外部审核模型名",
+        "type": "string",
+        "hint": "可选。会随请求体一起发送，便于 OpenAI 兼容或自定义审核服务选择模型。",
+        "default": ""
+    },
+    "external_review_timeout": {
+        "description": "外部审核超时时间（秒）",
+        "type": "int",
+        "hint": "外部审核接口的单次请求超时时间。",
+        "default": 30
+    },
+    "external_review_fail_closed": {
+        "description": "外部审核失败时保守拦截",
+        "type": "bool",
+        "hint": "开启后，外部审核启用但失败、未配置或无图时会拦截；关闭后只采用服务 metadata 结果。",
+        "default": true
     }
 }
