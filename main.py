@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import inspect
 import json
 import re
 import time
@@ -18,7 +19,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 DEFAULT_API_URL = "https://sd.loping151.com/api/generate"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 
 
 class XWDrawApiError(Exception):
@@ -453,6 +454,8 @@ class XWDrawPlugin(Star):
         self.presets_cache: Optional[Dict[str, Any]] = None
         self.cache_time = 0.0
         self.cache_duration = 300
+        self.switch_state_path = self.plugin_data_dir / "switches.json"
+        self.switch_state = self._load_switch_state()
         self.client = self._build_client()
 
     async def initialize(self):
@@ -513,6 +516,152 @@ class XWDrawPlugin(Star):
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
         return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+    def _load_switch_state(self) -> Dict[str, Any]:
+        try:
+            if self.switch_state_path.exists():
+                data = json.loads(self.switch_state_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.setdefault("session_overrides", {})
+                    return data
+        except Exception as exc:
+            logger.warning(f"读取绘图开关状态失败: {exc}")
+        return {"session_overrides": {}}
+
+    def _save_switch_state(self):
+        try:
+            self.switch_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.switch_state_path.write_text(json.dumps(self.switch_state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"保存绘图开关状态失败: {exc}")
+
+    def _session_switch_overrides(self) -> Dict[str, bool]:
+        overrides = self.switch_state.setdefault("session_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+            self.switch_state["session_overrides"] = overrides
+        return overrides
+
+    def _is_plugin_enabled_for_event(self, event: AstrMessageEvent) -> bool:
+        session_id = self._session_id(event)
+        overrides = self._session_switch_overrides()
+        if session_id and session_id in overrides:
+            return bool(overrides[session_id])
+        return self._bool_conf("plugin_enabled", True)
+
+    def _switch_status_text(self, event: AstrMessageEvent) -> str:
+        session_id = self._session_id(event) or "unknown"
+        overrides = self._session_switch_overrides()
+        if session_id in overrides:
+            source = "当前会话设置"
+            enabled = bool(overrides[session_id])
+        else:
+            source = "配置默认值"
+            enabled = self._bool_conf("plugin_enabled", True)
+        default_text = "开启" if self._bool_conf("plugin_enabled", True) else "关闭"
+        current_text = "开启" if enabled else "关闭"
+        return f"绘图总开关：{current_text}\n作用范围：当前会话/群 ({session_id})\n状态来源：{source}\n配置默认：{default_text}"
+
+    def _set_session_switch(self, event: AstrMessageEvent, enabled: bool):
+        session_id = self._session_id(event)
+        if not session_id:
+            raise XWDrawApiError("无法识别当前会话，不能保存绘图开关状态。")
+        self._session_switch_overrides()[session_id] = enabled
+        self._save_switch_state()
+
+    def _disabled_result(self, event: AstrMessageEvent):
+        if self._is_plugin_enabled_for_event(event):
+            return None
+        return event.plain_result("本群/当前会话的绘图插件总开关已关闭。请联系群管理员发送 `绘图开启` 后再使用。")
+
+    async def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def _sender_id(self, event: AstrMessageEvent) -> str:
+        for method in ("get_sender_id", "get_user_id"):
+            try:
+                value = getattr(event, method)()
+                if value:
+                    return str(value)
+            except Exception:
+                pass
+        for obj in self._event_candidate_objects(event):
+            for attr in ("user_id", "sender_id", "id", "uin", "qq"):
+                value = self._get_attr_or_key(obj, attr)
+                if value:
+                    return str(value)
+        return ""
+
+    def _event_candidate_objects(self, event: AstrMessageEvent) -> List[Any]:
+        message_obj = getattr(event, "message_obj", None)
+        candidates: List[Any] = [
+            event,
+            getattr(event, "sender", None),
+            message_obj,
+            getattr(message_obj, "sender", None),
+        ]
+        raw_message = getattr(message_obj, "raw_message", None)
+        if isinstance(raw_message, dict):
+            candidates.append(raw_message)
+            candidates.append(raw_message.get("sender"))
+        return [item for item in candidates if item is not None]
+
+    @staticmethod
+    def _get_attr_or_key(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    def _sender_role_values(self, event: AstrMessageEvent) -> List[str]:
+        values: List[str] = []
+        for obj in self._event_candidate_objects(event):
+            for attr in ("role", "permission", "user_role", "sender_role", "group_role"):
+                value = self._get_attr_or_key(obj, attr)
+                if value:
+                    values.append(str(value).strip().lower())
+            for attr in ("is_admin", "admin", "is_owner", "owner"):
+                value = self._get_attr_or_key(obj, attr)
+                if self._truthy(value):
+                    values.append("admin")
+        return values
+
+    async def _is_switch_admin(self, event: AstrMessageEvent) -> bool:
+        sender_id = self._sender_id(event)
+        if sender_id and sender_id in self._list_conf("switch_admin_user_ids"):
+            return True
+
+        try:
+            is_admin_attr = getattr(event, "is_admin", None)
+            is_admin = await self._maybe_await(is_admin_attr() if callable(is_admin_attr) else is_admin_attr)
+            if self._truthy(is_admin):
+                return True
+        except Exception:
+            pass
+
+        if self._bool_conf("group_admin_can_toggle", True):
+            roles = set(self._sender_role_values(event))
+            if roles.intersection({"owner", "admin", "administrator", "群主", "管理员"}):
+                return True
+        return False
+
+    @staticmethod
+    def _parse_switch_action(raw: str) -> Optional[bool]:
+        tokens = raw.strip().split()
+        command = tokens[0] if tokens else ""
+        if any(word in command for word in ("开启", "打开", "启用")):
+            return True
+        if any(word in command for word in ("关闭", "禁用", "停止")):
+            return False
+        if len(tokens) < 2:
+            return None
+        value = tokens[1].strip().lower()
+        if value in {"开", "开启", "打开", "启用", "on", "enable", "enabled", "true", "1"}:
+            return True
+        if value in {"关", "关闭", "禁用", "停止", "off", "disable", "disabled", "false", "0"}:
+            return False
+        return None
 
     @staticmethod
     def parse_generate_args(prompt_line: str) -> GenerateArgs:
@@ -846,8 +995,30 @@ class XWDrawPlugin(Star):
         logger.exception("XWDraw 命令执行失败")
         return event.plain_result(f"发生未知错误：{exc}")
 
+    @filter.command("绘图开关", aliases={"绘图状态", "绘图开启", "绘图关闭", "xw开关", "xwdraw_switch"}, prefix_optional=True)
+    async def on_plugin_switch(self, event: AstrMessageEvent):
+        action = self._parse_switch_action(event.message_str)
+        if action is None:
+            yield event.plain_result(self._switch_status_text(event) + "\n用法：绘图开启 / 绘图关闭 / 绘图开关 开|关")
+            return
+
+        if not await self._is_switch_admin(event):
+            yield event.plain_result("只有群管理员/群主或配置中的开关管理员可以修改绘图总开关。")
+            return
+
+        try:
+            self._set_session_switch(event, action)
+            state_text = "开启" if action else "关闭"
+            yield event.plain_result(f"已{state_text}当前群/会话的绘图插件总开关。\n{self._switch_status_text(event)}")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
     @filter.command("测试来点", aliases={"test_xwdraw"}, prefix_optional=True)
     async def on_test_generate(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         raw = event.message_str.strip()
         parts = raw.split(maxsplit=1)
         prompt = parts[1].strip() if len(parts) > 1 else "无提示词"
@@ -863,6 +1034,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("来点", aliases={"小千来点", "xwdraw"}, prefix_optional=True)
     async def on_generate(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         raw = event.message_str.strip()
         parts = raw.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
@@ -903,6 +1078,7 @@ class XWDrawPlugin(Star):
 【图片生成】
 来点/小千来点 <提示词> [--r18] [--r18g] [-d 0.6]
 测试来点 <提示词>
+绘图开关 / 绘图开启 / 绘图关闭 - 群管理员控制当前群总开关
 
 【服务状态】
 绘图账号 / 绘图配额
@@ -940,6 +1116,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("绘图账号", aliases={"绘图配额", "xw账号"}, prefix_optional=True)
     async def on_account(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().verify()
             yield event.plain_result("绘图账号信息\n" + self._format_data(data))
@@ -948,6 +1128,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("生成配置", aliases={"绘图配置", "generation_config"}, prefix_optional=True)
     async def on_generation_config(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().generation_config()
             yield event.plain_result("生成配置\n" + self._format_data(data))
@@ -956,6 +1140,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("绘图公告", aliases={"xw公告"}, prefix_optional=True)
     async def on_announcements(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().announcements()
             yield event.plain_result(self._format_items(data, "绘图公告", limit=8))
@@ -964,6 +1152,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("绘图队列", aliases={"队列状态", "xw队列"}, prefix_optional=True)
     async def on_queue_status(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().queue_status()
             count = data.get("queue_count") if isinstance(data, dict) else data
@@ -973,6 +1165,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("推荐提示", aliases={"推荐prompt", "推荐prompts"}, prefix_optional=True)
     async def on_recommended_prompts(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().recommended_prompts()
             yield event.plain_result(self._format_items(data, "推荐提示", limit=12))
@@ -981,6 +1177,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("预设列表", aliases={"presets", "预设"}, prefix_optional=True)
     async def on_list_presets(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         presets = await self._get_presets()
         if not presets:
             yield event.plain_result("获取预设列表失败，请稍后重试。")
@@ -998,6 +1198,10 @@ class XWDrawPlugin(Star):
         yield event.plain_result(msg)
 
     async def _send_preset_list(self, event: AstrMessageEvent, key: str, title: str):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         presets = await self._get_presets()
         if not presets or key not in presets:
             yield event.plain_result(f"获取{title}失败。")
@@ -1030,6 +1234,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("预设详情", aliases={"preset", "预设信息"}, prefix_optional=True)
     async def on_preset_detail(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         raw = event.message_str.strip()
         parts = raw.split(maxsplit=2)
         if len(parts) < 3:
@@ -1045,6 +1253,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("预设图片", aliases={"preset_image"}, prefix_optional=True)
     async def on_preset_image(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=2)
         if len(parts) < 3:
             yield event.plain_result("用法：预设图片 <类型> <图片名>")
@@ -1061,6 +1273,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("添加预设", aliases={"新建预设", "addpreset"}, prefix_optional=True)
     async def on_add_preset(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2 or "|" not in parts[1]:
             yield event.plain_result("用法：添加预设 <名称>|<内容>")
@@ -1079,6 +1295,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("删除预设", aliases={"移除预设", "delpreset"}, prefix_optional=True)
     async def on_delete_preset(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
             yield event.plain_result("用法：删除预设 <名称>")
@@ -1092,6 +1312,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("我的预设", aliases={"自定义预设", "mypresets"}, prefix_optional=True)
     async def on_my_presets(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().user_presets()
             yield event.plain_result(self._format_items(data, "我的预设", limit=20))
@@ -1105,6 +1329,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("服装预览", aliases={"costume_image"}, prefix_optional=True)
     async def on_costume_image(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
             yield event.plain_result("用法：服装预览 <服装名称>")
@@ -1121,6 +1349,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("最近图片", aliases={"recent_images"}, prefix_optional=True)
     async def on_recent_images(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         tokens = event.message_str.strip().split()[1:]
         limit = self._parse_limit(tokens, default=12, max_value=50)
         include_r18 = "--r18" in tokens or "--all" in tokens
@@ -1133,6 +1365,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("图片元数据", aliases={"图片metadata", "image_metadata"}, prefix_optional=True)
     async def on_image_metadata(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         date_folder, filename = self._extract_image_ref(event.message_str)
         if not date_folder or not filename:
             yield event.plain_result("用法：图片元数据 <日期>/<文件名>")
@@ -1145,6 +1381,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("更新图片标签", aliases={"图片标签", "update_image_tags"}, prefix_optional=True)
     async def on_update_image_tags(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         raw = event.message_str.strip()
         tokens = raw.split()
         date_folder, filename = self._extract_image_ref(raw)
@@ -1174,6 +1414,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("画廊列表", aliases={"gallery_images", "图库列表"}, prefix_optional=True)
     async def on_gallery_images(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         tokens = event.message_str.strip().split()[1:]
         page = self._parse_limit(tokens, default=1, max_value=999)
         search_tokens = [token for token in tokens if not token.isdigit() and not token.startswith("--")]
@@ -1193,6 +1437,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("画廊筛选", aliases={"gallery_filters", "图库筛选"}, prefix_optional=True)
     async def on_gallery_filters(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().gallery_json("/gallery/filters")
             yield event.plain_result("画廊筛选项\n" + self._format_data(data))
@@ -1201,6 +1449,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("视频生成", aliases={"生成视频", "video_generate"}, prefix_optional=True)
     async def on_video_generate(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         raw = event.message_str.strip()
         parts = raw.split(maxsplit=1)
         if len(parts) < 2:
@@ -1234,6 +1486,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("视频历史", aliases={"video_history"}, prefix_optional=True)
     async def on_video_history(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         try:
             data = await self._api().video_history()
             yield event.plain_result(self._format_items(data, "视频历史", limit=10))
@@ -1241,6 +1497,10 @@ class XWDrawPlugin(Star):
             yield await self._handle_api_error(event, exc)
 
     async def _handle_video_file(self, event: AstrMessageEvent, kind: str, image_like: bool):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=2)
         if len(parts) < 3:
             yield event.plain_result("用法：视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>")
@@ -1280,6 +1540,10 @@ class XWDrawPlugin(Star):
 
     @filter.command("绘图文档", aliases={"xw文档", "drawing_doc"}, prefix_optional=True)
     async def on_document(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
             yield event.plain_result("可下载文档：涩涩词条大全、常规法典、色色法典\n用法：绘图文档 <名称>")

@@ -134,10 +134,14 @@ class MockContext:
 
 
 class MockEvent:
-    def __init__(self, message_str, message=None):
+    def __init__(self, message_str, message=None, session="test-session", sender_id="10001", role=None, is_admin=False):
         self.message_str = message_str
         self.message_obj = types.SimpleNamespace(message=message or [])
-        self.unified_msg_origin = "test-session"
+        self.message_obj.sender = types.SimpleNamespace(user_id=sender_id, role=role)
+        self.unified_msg_origin = session
+        self._sender_id = sender_id
+        self._role = role
+        self._is_admin = is_admin
 
     def plain_result(self, text):
         return ("plain", text)
@@ -147,6 +151,15 @@ class MockEvent:
 
     def get_self_id(self):
         return "10000"
+
+    def get_sender_id(self):
+        return self._sender_id
+
+    def get_group_id(self):
+        return self.unified_msg_origin
+
+    def is_admin(self):
+        return self._is_admin
 
 
 async def collect_asyncgen(asyncgen):
@@ -205,9 +218,15 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
             "r18_block_r18g": True,
             "r18_nsfw_score_threshold": 0.65,
             "external_review_enabled": False,
+            "plugin_enabled": True,
+            "group_admin_can_toggle": True,
+            "switch_admin_user_ids": "",
         }
         base_config.update(config or {})
-        return main.XWDrawPlugin(MockContext(), base_config)
+        plugin = main.XWDrawPlugin(MockContext(), base_config)
+        plugin.switch_state_path = Path(tempfile.mkdtemp()) / "switches.json"
+        plugin.switch_state = {"session_overrides": {}}
+        return plugin
 
     def test_url_helpers_encode_and_split_image_refs(self):
         client = main.XWDrawApiClient("https://sd.loping151.com/api/generate", "token", 5)
@@ -292,6 +311,31 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.client.updated_tags["filename"], "test.png")
         self.assertIsNone(plugin.client.updated_tags["is_r18"])
         self.assertTrue(plugin.client.updated_tags["is_r18g"])
+
+    async def test_group_admin_can_disable_and_block_generate(self):
+        plugin = self.make_plugin()
+        plugin.client = FakeClient(main.GeneratedAsset(image_bytes=b"png", metadata={"nsfw_score": 0.01}, elapsed=0.5))
+
+        close_results = await collect_asyncgen(plugin.on_plugin_switch(MockEvent("绘图关闭", role="admin")))
+        self.assertIn("已关闭", close_results[0][1])
+        self.assertFalse(plugin._is_plugin_enabled_for_event(MockEvent("绘图状态")))
+
+        generate_results = await collect_asyncgen(plugin.on_generate(MockEvent("来点 safe prompt")))
+        self.assertIn("总开关已关闭", generate_results[0][1])
+        self.assertIsNone(plugin.client.generate_payload)
+
+    async def test_normal_member_cannot_toggle_switch(self):
+        plugin = self.make_plugin()
+        results = await collect_asyncgen(plugin.on_plugin_switch(MockEvent("绘图关闭", role="member")))
+        self.assertIn("只有群管理员", results[0][1])
+        self.assertTrue(plugin._is_plugin_enabled_for_event(MockEvent("绘图状态")))
+
+    async def test_configured_switch_admin_can_toggle(self):
+        plugin = self.make_plugin({"plugin_enabled": False, "switch_admin_user_ids": "42"})
+        event = MockEvent("绘图开启", sender_id="42", role="member")
+        results = await collect_asyncgen(plugin.on_plugin_switch(event))
+        self.assertIn("已开启", results[0][1])
+        self.assertTrue(plugin._is_plugin_enabled_for_event(event))
 
 
 class XWDrawClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
