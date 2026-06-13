@@ -19,7 +19,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 DEFAULT_API_URL = "https://sd.loping151.com/api/generate"
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 
 
 class XWDrawApiError(Exception):
@@ -627,24 +627,46 @@ class XWDrawPlugin(Star):
                     values.append("admin")
         return values
 
+    async def _is_bot_admin(self, event: AstrMessageEvent) -> bool:
+        try:
+            is_admin_attr = getattr(event, "is_admin", None)
+            is_admin = await self._maybe_await(is_admin_attr() if callable(is_admin_attr) else is_admin_attr)
+            return self._truthy(is_admin)
+        except Exception:
+            return False
+
+    async def _admin_only_result(self, event: AstrMessageEvent):
+        if await self._is_bot_admin(event):
+            return None
+        return event.plain_result("该功能仅 bot 管理员可用。")
+
     async def _is_switch_admin(self, event: AstrMessageEvent) -> bool:
         sender_id = self._sender_id(event)
         if sender_id and sender_id in self._list_conf("switch_admin_user_ids"):
             return True
 
-        try:
-            is_admin_attr = getattr(event, "is_admin", None)
-            is_admin = await self._maybe_await(is_admin_attr() if callable(is_admin_attr) else is_admin_attr)
-            if self._truthy(is_admin):
-                return True
-        except Exception:
-            pass
+        if await self._is_bot_admin(event):
+            return True
 
         if self._bool_conf("group_admin_can_toggle", True):
             roles = set(self._sender_role_values(event))
             if roles.intersection({"owner", "admin", "administrator", "群主", "管理员"}):
                 return True
         return False
+
+    def _is_r18_allowed_session(self, event: AstrMessageEvent) -> bool:
+        return self._session_id(event) in self._list_conf("r18_allowed_session_ids")
+
+    @staticmethod
+    def _has_sensitive_flag(text_or_tokens: Any) -> bool:
+        if isinstance(text_or_tokens, str):
+            text = text_or_tokens
+        else:
+            text = " ".join(str(token) for token in text_or_tokens)
+        return bool(re.search(r"(^|\s)--(?:r18g?|all)(\s|$)", text, flags=re.I))
+
+    def _sensitive_content_denied_result(self, event: AstrMessageEvent):
+        return event.plain_result("当前会话不允许生成或查看该类型内容，已取消请求。")
 
     @staticmethod
     def _parse_switch_action(raw: str) -> Optional[bool]:
@@ -686,12 +708,18 @@ class XWDrawPlugin(Star):
         try:
             if not url_or_path:
                 return None
-            if Path(str(url_or_path)).is_file():
-                return Path(str(url_or_path)).read_bytes()
-            if str(url_or_path).startswith("http"):
+            value = str(url_or_path)
+            if value.startswith("file://"):
+                parsed_path = unquote(urlparse(value).path)
+                if re.match(r"^/[A-Za-z]:/", parsed_path):
+                    parsed_path = parsed_path[1:]
+                value = parsed_path
+            if Path(value).is_file():
+                return Path(value).read_bytes()
+            if value.startswith("http"):
                 timeout_obj = aiohttp.ClientTimeout(total=timeout)
                 async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                    async with session.get(str(url_or_path), headers=headers) as resp:
+                    async with session.get(value, headers=headers) as resp:
                         resp.raise_for_status()
                         return await resp.read()
         except Exception as exc:
@@ -715,6 +743,13 @@ class XWDrawPlugin(Star):
     async def _image_segment_bytes(self, seg: Any, timeout: int) -> Optional[bytes]:
         if not isinstance(seg, Image):
             return None
+        data = getattr(seg, "data", None)
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            decoded = XWDrawApiClient._decode_image_base64(data)
+            if decoded:
+                return decoded
         image_src = getattr(seg, "url", None) or getattr(seg, "file", None) or getattr(seg, "path", None)
         return await self._fetch_image_bytes(str(image_src), timeout) if image_src else None
 
@@ -782,6 +817,18 @@ class XWDrawPlugin(Star):
 
         return service_decision
 
+    async def _review_input_image(self, image_bytes: bytes, event: Optional[AstrMessageEvent] = None) -> ReviewDecision:
+        if not self._bool_conf("r18_review_enabled", True):
+            return ReviewDecision(True, source="disabled", reason="审查已关闭")
+
+        if event and self._session_id(event) in self._list_conf("r18_allowed_session_ids"):
+            return ReviewDecision(True, source="allowed_session", reason="当前会话在放行列表中")
+
+        if self._bool_conf("external_review_enabled", False):
+            return await self._external_review(image_bytes, {})
+
+        return ReviewDecision(True, level="unknown", source="input_image_review", reason="未启用外部审核，输入图仅在生成后继续审查")
+
     def _review_service_metadata(self, metadata: Dict[str, Any]) -> ReviewDecision:
         metadata = self._flatten_review_metadata(metadata)
         block_r18 = self._bool_conf("r18_block_r18", True)
@@ -840,7 +887,7 @@ class XWDrawPlugin(Star):
                 "model": self._conf("external_review_model", ""),
                 "image": image_data_url,
                 "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
-                "metadata": metadata,
+                "metadata": self._external_review_metadata(metadata),
             }
         headers = {"Content-Type": "application/json"}
         api_key = str(self._conf("external_review_api_key", "") or "").strip()
@@ -902,21 +949,23 @@ class XWDrawPlugin(Star):
 
     def _openai_review_payload(self, image_data_url: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         model = str(self._conf("external_review_model", "") or "").strip() or "gpt-4o-mini"
-        prompt = (
+        system_prompt = (
             "你是图片安全审核器。只返回一个 JSON 对象，不要 Markdown，不要解释。"
             "字段必须包含 safe(boolean), level(\"safe\"|\"r18\"|\"r18g\"), score(number), reason(string)。"
             "score 必须是不安全/NSFW/违规风险分，0 表示完全安全，1 表示高度违规；不要把 score 当作安全置信度。"
             "当 safe=true 且 level=safe 时，score 应小于 0.2。"
             "若图片包含裸露、性行为、色情暗示、成人内容、未成年人性化、血腥猎奇或其他不适合群聊发送的内容，safe=false。"
-            f"服务 metadata: {json.dumps(self._flatten_review_metadata(metadata), ensure_ascii=False)[:1200]}"
         )
+        review_metadata = self._external_review_metadata(metadata)
+        user_prompt = "请审核这张图片。服务自审字段：" + json.dumps(review_metadata, ensure_ascii=False)[:800]
         return {
             "model": model,
             "messages": [
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": user_prompt},
                         {"type": "image_url", "image_url": {"url": image_data_url}},
                     ],
                 }
@@ -924,6 +973,11 @@ class XWDrawPlugin(Star):
             "temperature": 0,
             "max_tokens": self._int_conf("external_review_max_tokens", 300),
         }
+
+    def _external_review_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        flat = self._flatten_review_metadata(metadata)
+        allowed_keys = ("is_r18", "is_r18g", "r18", "r18g", "nsfw", "nsfw_score", "score", "date_folder")
+        return {key: flat[key] for key in allowed_keys if key in flat}
 
     def _extract_external_review_payload(self, decoded: Any, raw_text: str = "") -> Any:
         if isinstance(decoded, dict):
@@ -1023,7 +1077,9 @@ class XWDrawPlugin(Star):
             return event.plain_result(caption)
         except Exception as exc:
             logger.error(f"发送图片失败: {exc}")
-            return event.plain_result(f"生成成功，但发送图片失败: {exc}")
+            if await self._is_bot_admin(event):
+                return event.plain_result(f"生成成功，但发送图片失败: {exc}")
+            return event.plain_result("生成成功，但发送图片失败，请联系 bot 管理员。")
 
     async def _send_generated_asset(self, event: AstrMessageEvent, asset: GeneratedAsset):
         decision = await self._review_generated_asset(asset, event)
@@ -1032,6 +1088,8 @@ class XWDrawPlugin(Star):
                 f"图片生成结果已拦截: source={decision.source}, level={decision.level}, "
                 f"score={decision.score}, reason={decision.reason}, filename={asset.filename}"
             )
+            if not await self._is_bot_admin(event):
+                return event.plain_result("生成完成，但图片未通过安全审核，已停止发送。")
             score_text = f"，score={decision.score:.3f}" if decision.score is not None else ""
             return event.plain_result(f"生成完成，但自审判定为 {decision.level}，已停止发送图片（{decision.reason}{score_text}）。")
 
@@ -1041,6 +1099,12 @@ class XWDrawPlugin(Star):
         if asset.image_bytes:
             return await self._send_image_bytes(event, asset.image_bytes, caption, asset.filename)
         return event.plain_result(f"生成完成 ({asset.elapsed:.1f}s)，但没有拿到可发送的图片数据。")
+
+    async def _review_blocked_text(self, event: AstrMessageEvent, prefix: str, decision: ReviewDecision) -> str:
+        if await self._is_bot_admin(event):
+            score_text = f"，score={decision.score:.3f}" if decision.score is not None else ""
+            return f"{prefix}自审未通过，已停止发送（{decision.reason}{score_text}）。"
+        return f"{prefix}未通过安全审核，已停止发送。"
 
     async def _send_file_bytes(self, event: AstrMessageEvent, data: bytes, filename: str, content_type: str = ""):
         out_dir = self.plugin_data_dir / "downloads"
@@ -1055,7 +1119,7 @@ class XWDrawPlugin(Star):
                 return event.plain_result(f"文件已发送：{out_path.name}")
         except Exception as exc:
             logger.debug(f"通用文件发送失败: {exc}")
-        return event.plain_result(f"文件已保存：{out_path}")
+        return event.plain_result(f"文件已保存到插件数据目录：{out_path.name}")
 
     @staticmethod
     def _safe_filename(filename: str) -> str:
@@ -1114,6 +1178,34 @@ class XWDrawPlugin(Star):
             return False
         return None
 
+    @staticmethod
+    def _parse_video_args(prompt_line: str) -> Tuple[str, str, str, str]:
+        tokens = prompt_line.split()
+        prompt_parts: List[str] = []
+        negative_parts: List[str] = []
+        duration = "4"
+        fps = "16"
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token == "-t" and i + 1 < len(tokens):
+                duration = tokens[i + 1]
+                i += 2
+                continue
+            if token == "-fps" and i + 1 < len(tokens):
+                fps = tokens[i + 1]
+                i += 2
+                continue
+            if token == "-n":
+                i += 1
+                while i < len(tokens) and tokens[i] not in {"-t", "-fps"}:
+                    negative_parts.append(tokens[i])
+                    i += 1
+                continue
+            prompt_parts.append(token)
+            i += 1
+        return " ".join(prompt_parts).strip(), duration, fps, " ".join(negative_parts).strip()
+
     def _extract_image_ref(self, raw: str) -> Tuple[Optional[str], Optional[str]]:
         parts = raw.strip().split(maxsplit=2)
         if len(parts) < 2:
@@ -1125,6 +1217,11 @@ class XWDrawPlugin(Star):
         return None, parts[1]
 
     async def _handle_api_error(self, event: AstrMessageEvent, exc: Exception):
+        if not await self._is_bot_admin(event):
+            logger.warning(f"XWDraw 命令执行失败: {exc}")
+            if isinstance(exc, asyncio.TimeoutError):
+                return event.plain_result("请求超时，请稍后重试。")
+            return event.plain_result("请求失败，请稍后重试或联系 bot 管理员。")
         if isinstance(exc, XWDrawApiError):
             return event.plain_result(f"请求失败：{exc.message}")
         if isinstance(exc, asyncio.TimeoutError):
@@ -1168,7 +1265,7 @@ class XWDrawPlugin(Star):
                 if decision.allowed and hasattr(Image, "fromBytes"):
                     msg_chain.append(Image.fromBytes(img_bytes))
                 elif not decision.allowed:
-                    msg_chain.append(Plain(f"图片回显自审未通过，已停止回显（{decision.reason}）。"))
+                    msg_chain.append(Plain(await self._review_blocked_text(event, "图片回显", decision)))
             else:
                 msg_chain.append(Plain("测试图片回显默认关闭，仅确认已检测到图片。"))
         else:
@@ -1184,12 +1281,15 @@ class XWDrawPlugin(Star):
         raw = event.message_str.strip()
         parts = raw.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            yield event.plain_result("用法：小千来点 <提示词> [--r18] [--r18g] [-d 0.6]\n提示：可以附带图片进行图生图。")
+            yield event.plain_result("用法：小千来点 <提示词> [-d 0.6]\n提示：可以附带图片进行图生图。")
             return
 
         args = self.parse_generate_args(parts[1])
         if not args.prompt:
             yield event.plain_result("提示词不能为空。")
+            return
+        if (args.is_r18 or args.is_r18g or self._has_sensitive_flag(parts[1])) and not self._is_r18_allowed_session(event):
+            yield self._sensitive_content_denied_result(event)
             return
         if not self._api().api_key:
             yield event.plain_result("请在插件配置中填写 api_key 后再使用本功能。")
@@ -1206,9 +1306,9 @@ class XWDrawPlugin(Star):
                 payload["denoising_strength"] = args.denoising_strength
 
             asset = await self._api().generate(payload)
-            if args.is_r18 and "is_r18" not in asset.metadata:
+            if args.is_r18:
                 asset.metadata["is_r18"] = True
-            if args.is_r18g and "is_r18g" not in asset.metadata:
+            if args.is_r18g:
                 asset.metadata["is_r18g"] = True
             yield await self._send_generated_asset(event, asset)
         except Exception as exc:
@@ -1216,52 +1316,76 @@ class XWDrawPlugin(Star):
 
     @filter.command("绘图帮助", aliases={"xw帮助", "xwhelp"}, prefix_optional=True)
     async def on_help(self, event: AstrMessageEvent):
-        help_text = """XW绘图插件使用指南
+        if await self._is_bot_admin(event):
+            yield event.plain_result(self._bot_admin_help_text())
+            return
+        if await self._is_switch_admin(event):
+            yield event.plain_result(self._switch_admin_help_text())
+            return
+        yield event.plain_result(self._public_help_text())
 
-【图片生成】
-来点/小千来点 <提示词> [--r18] [--r18g] [-d 0.6]
-测试来点 <提示词>
-绘图开关 / 绘图开启 / 绘图关闭 - 群管理员控制当前群总开关
+    def _public_help_text(self) -> str:
+        return """XW绘图帮助
 
-【服务状态】
-绘图账号 / 绘图配额
-生成配置
-绘图公告
-绘图队列
-推荐提示
+【生成】
+来点 <提示词>
+小千来点 <提示词>
+附带图片 + 来点 <提示词> - 图生图
 
 【预设】
 预设列表
 角色列表 / 风格列表 / 服装列表
-预设详情 <character|style|costume> <名称>
+预设详情 <类型> <名称>
 预设图片 <类型> <图片名>
+服装预览 <名称>
+
+【视频】
+附带图片 + 视频生成 <提示词> [-t 秒] [-fps 帧率] [-n 负面提示词]
+
+【信息】
+绘图公告
+推荐提示
+绘图状态
+"""
+
+    def _switch_admin_help_text(self) -> str:
+        return self._public_help_text() + """
+【群管理】
+绘图开启
+绘图关闭
+绘图开关 开|关
+"""
+
+    def _bot_admin_help_text(self) -> str:
+        return self._switch_admin_help_text() + """
+【Bot 管理员】
+绘图账号 / 绘图配额
+生成配置
+绘图队列
+最近图片 [数量]
+图片元数据 <日期>/<文件名>
+更新图片标签 <日期>/<文件名> r18=true r18g=false
+画廊列表 [页码] [关键词]
+画廊筛选
+视频历史
+视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>
 添加预设 <名称>|<内容>
 删除预设 <名称>
 我的预设
-服装预览 <名称>
+绘图文档 <名称>
 
-【图库】
-最近图片 [数量] [--r18] [--r18g]
-图片元数据 <日期>/<文件名>
-更新图片标签 <日期>/<文件名> r18=true r18g=false
-画廊列表 [页码] [关键词] [--r18] [--r18g]
-画廊筛选
-
-【视频】
-视频生成 <提示词> [-t 秒] [-fps 帧率] [-n 负面提示词]（需附带图片）
-视频历史
-视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>
-
-【文档】
-绘图文档 [涩涩词条大全|常规法典|色色法典]
+敏感内容相关查询和生成只允许在配置白名单会话内使用。
 """
-        yield event.plain_result(help_text)
 
     @filter.command("绘图账号", aliases={"绘图配额", "xw账号"}, prefix_optional=True)
     async def on_account(self, event: AstrMessageEvent):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         try:
             data = await self._api().verify()
@@ -1274,6 +1398,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         try:
             data = await self._api().generation_config()
@@ -1298,6 +1426,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         try:
             data = await self._api().queue_status()
@@ -1408,7 +1540,7 @@ class XWDrawPlugin(Star):
             data, _ctype = await self._api().preset_image(parts[1], parts[2])
             decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
             if not decision.allowed:
-                yield event.plain_result(f"预设图片自审未通过，已停止发送（{decision.reason}）。")
+                yield event.plain_result(await self._review_blocked_text(event, "预设图片", decision))
                 return
             yield await self._send_image_bytes(event, data, "预设图片", parts[2])
         except Exception as exc:
@@ -1419,6 +1551,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2 or "|" not in parts[1]:
@@ -1442,6 +1578,10 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
             yield event.plain_result("用法：删除预设 <名称>")
@@ -1458,6 +1598,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         try:
             data = await self._api().user_presets()
@@ -1484,7 +1628,7 @@ class XWDrawPlugin(Star):
             data, _ctype = await self._api().costume_image(parts[1].strip())
             decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
             if not decision.allowed:
-                yield event.plain_result(f"服装预览自审未通过，已停止发送（{decision.reason}）。")
+                yield event.plain_result(await self._review_blocked_text(event, "服装预览", decision))
                 return
             yield await self._send_image_bytes(event, data, "服装预览", parts[1].strip() + ".png")
         except Exception as exc:
@@ -1496,7 +1640,14 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         tokens = event.message_str.strip().split()[1:]
+        if self._has_sensitive_flag(tokens) and not self._is_r18_allowed_session(event):
+            yield self._sensitive_content_denied_result(event)
+            return
         limit = self._parse_limit(tokens, default=12, max_value=50)
         include_r18 = "--r18" in tokens or "--all" in tokens
         include_r18g = "--r18g" in tokens or "--all" in tokens
@@ -1511,6 +1662,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         date_folder, filename = self._extract_image_ref(event.message_str)
         if not date_folder or not filename:
@@ -1527,6 +1682,10 @@ class XWDrawPlugin(Star):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         raw = event.message_str.strip()
         tokens = raw.split()
@@ -1561,7 +1720,14 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         tokens = event.message_str.strip().split()[1:]
+        if self._has_sensitive_flag(tokens) and not self._is_r18_allowed_session(event):
+            yield self._sensitive_content_denied_result(event)
+            return
         page = self._parse_limit(tokens, default=1, max_value=999)
         search_tokens = [token for token in tokens if not token.isdigit() and not token.startswith("--")]
         params = {
@@ -1584,6 +1750,10 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         try:
             data = await self._api().gallery_json("/gallery/filters")
             yield event.plain_result("画廊筛选项\n" + self._format_data(data))
@@ -1601,19 +1771,26 @@ class XWDrawPlugin(Star):
         if len(parts) < 2:
             yield event.plain_result("用法：视频生成 <提示词> [-t 秒] [-fps 帧率] [-n 负面提示词]，并附带图片。")
             return
-        prompt_line = parts[1]
-        duration = self._regex_arg(prompt_line, r"(?:^|\s)-t\s+(\d+)", "4")
-        fps = self._regex_arg(prompt_line, r"(?:^|\s)-fps\s+(\d+)", "16")
-        negative = self._regex_arg(prompt_line, r"(?:^|\s)-n\s+(.+)$", "")
-        prompt = re.sub(r"(?:^|\s)-t\s+\d+", " ", prompt_line)
-        prompt = re.sub(r"(?:^|\s)-fps\s+\d+", " ", prompt)
-        prompt = re.sub(r"(?:^|\s)-n\s+.+$", " ", prompt).strip()
+        prompt, duration, fps, negative = self._parse_video_args(parts[1])
         if not prompt:
             yield event.plain_result("视频提示词不能为空。")
             return
+        try:
+            fps_int = int(fps)
+        except Exception:
+            yield event.plain_result("视频 fps 必须是 12 到 24 之间的整数。")
+            return
+        if fps_int < 12 or fps_int > 24:
+            yield event.plain_result("视频 fps 必须是 12 到 24 之间的整数。")
+            return
+        fps = str(fps_int)
         image_bytes = await self._get_image_from_event(event, self._int_conf("timeout", 60))
         if not image_bytes:
             yield event.plain_result("视频生成需要附带一张起始图片。")
+            return
+        decision = await self._review_input_image(image_bytes, event)
+        if not decision.allowed:
+            yield event.plain_result(await self._review_blocked_text(event, "起始图片", decision))
             return
         try:
             yield event.plain_result("收到视频生成请求，正在提交任务。")
@@ -1622,16 +1799,15 @@ class XWDrawPlugin(Star):
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
-    @staticmethod
-    def _regex_arg(text: str, pattern: str, default: str) -> str:
-        match = re.search(pattern, text)
-        return match.group(1).strip() if match else default
-
     @filter.command("视频历史", aliases={"video_history"}, prefix_optional=True)
     async def on_video_history(self, event: AstrMessageEvent):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
             return
         try:
             data = await self._api().video_history()
@@ -1644,6 +1820,10 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         parts = event.message_str.strip().split(maxsplit=2)
         if len(parts) < 3:
             yield event.plain_result("用法：视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>")
@@ -1653,7 +1833,7 @@ class XWDrawPlugin(Star):
             if image_like:
                 decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
                 if not decision.allowed:
-                    yield event.plain_result(f"图片自审未通过，已停止发送（{decision.reason}）。")
+                    yield event.plain_result(await self._review_blocked_text(event, "图片", decision))
                     return
                 yield await self._send_image_bytes(event, data, f"{kind} 获取成功", f"{parts[1]}_{kind}.png")
             else:
@@ -1687,9 +1867,13 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
-            yield event.plain_result("可下载文档：涩涩词条大全、常规法典、色色法典\n用法：绘图文档 <名称>")
+            yield event.plain_result("用法：绘图文档 <名称>")
             return
         doc_name = parts[1].strip()
         try:
