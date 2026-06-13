@@ -241,7 +241,7 @@ class XWDrawApiClient:
                 try:
                     metadata = await self.image_metadata(asset.date_folder, asset.filename)
                     if isinstance(metadata, dict):
-                        asset.metadata.update(metadata)
+                        asset.metadata.update(self._extract_metadata(metadata))
                 except Exception as exc:
                     logger.debug(f"读取图片 metadata 失败: {exc}")
 
@@ -765,6 +765,7 @@ class XWDrawPlugin(Star):
         if event and self._session_id(event) in self._list_conf("r18_allowed_session_ids"):
             return ReviewDecision(True, source="allowed_session", reason="当前会话在放行列表中")
 
+        asset.metadata = self._flatten_review_metadata(asset.metadata)
         service_decision = self._review_service_metadata(asset.metadata)
         if not service_decision.allowed:
             return service_decision
@@ -773,10 +774,16 @@ class XWDrawPlugin(Star):
             external = await self._external_review(asset.image_bytes, asset.metadata)
             if not external.allowed:
                 return external
+            if external.source == "external_review":
+                return external
+
+        if not self._has_review_metadata(asset.metadata) and self._bool_conf("r18_fail_without_metadata", True):
+            return ReviewDecision(False, level="unknown", source="missing_metadata", reason="图片缺少可用自审 metadata，按安全策略拦截")
 
         return service_decision
 
     def _review_service_metadata(self, metadata: Dict[str, Any]) -> ReviewDecision:
+        metadata = self._flatten_review_metadata(metadata)
         block_r18 = self._bool_conf("r18_block_r18", True)
         block_r18g = self._bool_conf("r18_block_r18g", True)
         threshold = self._float_conf("r18_nsfw_score_threshold", 0.65)
@@ -792,24 +799,49 @@ class XWDrawPlugin(Star):
             return ReviewDecision(False, level="r18", source="service_metadata", score=score, reason=f"nsfw_score={score:.3f} 超过阈值 {threshold:.3f}")
         return ReviewDecision(True, level="safe", source="service_metadata", score=score, reason="metadata 未触发拦截")
 
+    @staticmethod
+    def _flatten_review_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(metadata, dict):
+            return {}
+        flat = dict(metadata)
+        for key in ("metadata", "image_metadata", "meta", "data"):
+            nested = flat.get(key)
+            if isinstance(nested, dict):
+                flat.update(XWDrawApiClient._extract_metadata(nested))
+        return XWDrawApiClient._extract_metadata(flat)
+
+    def _has_review_metadata(self, metadata: Dict[str, Any]) -> bool:
+        flat = self._flatten_review_metadata(metadata)
+        for key in ("is_r18", "is_r18g", "r18", "r18g", "nsfw", "nsfw_score", "score"):
+            if key in flat and flat.get(key) not in (None, ""):
+                return True
+        return False
+
     async def _external_review(self, image_bytes: Optional[bytes], metadata: Dict[str, Any]) -> ReviewDecision:
         if not image_bytes:
             if self._bool_conf("external_review_fail_closed", True):
                 return ReviewDecision(False, level="unknown", source="external_review", reason="外部审核启用但没有图片数据")
-            return ReviewDecision(True, source="external_review", reason="无图片数据，按配置放行")
+            return ReviewDecision(True, source="external_review_error", reason="无图片数据，按配置放行")
 
         api_url = str(self._conf("external_review_api_url", "") or "").strip()
         if not api_url:
             if self._bool_conf("external_review_fail_closed", True):
                 return ReviewDecision(False, level="unknown", source="external_review", reason="外部审核启用但未配置接口地址")
-            return ReviewDecision(True, source="external_review", reason="未配置外部审核接口，按配置放行")
+            return ReviewDecision(True, source="external_review_error", reason="未配置外部审核接口，按配置放行")
 
-        payload = {
-            "model": self._conf("external_review_model", ""),
-            "image": "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8"),
-            "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
-            "metadata": metadata,
-        }
+        protocol = self._external_review_protocol(api_url)
+        image_data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
+        if protocol == "openai":
+            post_url = self._openai_review_url(api_url)
+            payload = self._openai_review_payload(image_data_url, metadata)
+        else:
+            post_url = api_url
+            payload = {
+                "model": self._conf("external_review_model", ""),
+                "image": image_data_url,
+                "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                "metadata": metadata,
+            }
         headers = {"Content-Type": "application/json"}
         api_key = str(self._conf("external_review_api_key", "") or "").strip()
         if api_key:
@@ -818,9 +850,9 @@ class XWDrawPlugin(Star):
         try:
             timeout = aiohttp.ClientTimeout(total=self._int_conf("external_review_timeout", 30))
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(api_url, json=payload, headers=headers) as resp:
+                async with session.post(post_url, json=payload, headers=headers) as resp:
                     text = await resp.text()
-                    result = XWDrawApiClient._decode_json_text(text)
+                    result = self._extract_external_review_payload(XWDrawApiClient._decode_json_text(text), text)
                     if resp.status >= 400:
                         raise XWDrawApiError(f"外部审核接口返回 HTTP {resp.status}: {text[:300]}", resp.status, result)
                     if not isinstance(result, dict):
@@ -830,22 +862,127 @@ class XWDrawPlugin(Star):
             logger.warning(f"外部审核失败: {exc}")
             if self._bool_conf("external_review_fail_closed", True):
                 return ReviewDecision(False, level="unknown", source="external_review", reason=f"外部审核失败: {exc}")
-            return ReviewDecision(True, source="external_review", reason=f"外部审核失败但按配置放行: {exc}")
+            return ReviewDecision(True, source="external_review_error", reason=f"外部审核失败但按配置放行: {exc}")
 
     def _decision_from_external_payload(self, payload: Dict[str, Any]) -> ReviewDecision:
-        label = str(payload.get("level") or payload.get("label") or payload.get("category") or "").lower()
+        label = str(payload.get("level") or payload.get("label") or payload.get("category") or payload.get("status") or "").lower()
         reason = str(payload.get("reason") or payload.get("message") or "外部审核判定")
         score = self._float_value(payload.get("score", payload.get("nsfw_score")))
         safe = payload.get("safe")
+        unsafe_labels = {"unsafe", "nsfw", "adult", "sexual", "porn", "pornography", "nudity", "nude", "explicit"}
         is_r18g = self._truthy(payload.get("r18g", payload.get("is_r18g"))) or label in {"r18g", "gore", "violence"}
-        is_r18 = self._truthy(payload.get("r18", payload.get("is_r18", payload.get("nsfw")))) or label in {"r18", "adult", "nsfw", "sexual"}
+        is_r18 = self._truthy(payload.get("r18", payload.get("is_r18", payload.get("nsfw")))) or label in {"r18", *unsafe_labels}
         if is_r18g and self._bool_conf("r18_block_r18g", True):
             return ReviewDecision(False, level="r18g", source="external_review", score=score, reason=reason)
         if is_r18 and self._bool_conf("r18_block_r18", True):
             return ReviewDecision(False, level="r18", source="external_review", score=score, reason=reason)
-        if safe is False:
+        if score is not None and score >= self._float_conf("r18_nsfw_score_threshold", 0.65):
+            return ReviewDecision(False, level=label or "r18", source="external_review", score=score, reason=f"{reason}; score={score:.3f} 超过阈值")
+        if self._falsey(safe):
             return ReviewDecision(False, level=label or "unsafe", source="external_review", score=score, reason=reason)
         return ReviewDecision(True, level=label or "safe", source="external_review", score=score, reason=reason)
+
+    def _external_review_protocol(self, api_url: str) -> str:
+        configured = str(self._conf("external_review_protocol", "auto") or "auto").strip().lower()
+        if configured in {"openai", "openai_chat", "chat_completions"}:
+            return "openai"
+        if configured in {"custom", "json"}:
+            return "custom"
+        normalized = api_url.rstrip("/").lower()
+        if normalized.endswith("/v1") or normalized.endswith("/chat/completions") or "/chat/completions" in normalized:
+            return "openai"
+        return "custom"
+
+    @staticmethod
+    def _openai_review_url(api_url: str) -> str:
+        url = api_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        return f"{url}/chat/completions"
+
+    def _openai_review_payload(self, image_data_url: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        model = str(self._conf("external_review_model", "") or "").strip() or "gpt-4o-mini"
+        prompt = (
+            "你是图片安全审核器。只返回一个 JSON 对象，不要 Markdown，不要解释。"
+            "字段必须包含 safe(boolean), level(\"safe\"|\"r18\"|\"r18g\"), score(number), reason(string)。"
+            "score 必须是不安全/NSFW/违规风险分，0 表示完全安全，1 表示高度违规；不要把 score 当作安全置信度。"
+            "当 safe=true 且 level=safe 时，score 应小于 0.2。"
+            "若图片包含裸露、性行为、色情暗示、成人内容、未成年人性化、血腥猎奇或其他不适合群聊发送的内容，safe=false。"
+            f"服务 metadata: {json.dumps(self._flatten_review_metadata(metadata), ensure_ascii=False)[:1200]}"
+        )
+        return {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": self._int_conf("external_review_max_tokens", 300),
+        }
+
+    def _extract_external_review_payload(self, decoded: Any, raw_text: str = "") -> Any:
+        if isinstance(decoded, dict):
+            content = self._openai_message_content(decoded)
+            if content:
+                parsed = self._parse_json_object_text(content)
+                if parsed is not None:
+                    return parsed
+                return None
+            if "choices" in decoded:
+                return None
+            return decoded
+        if isinstance(decoded, str):
+            return self._parse_json_object_text(decoded)
+        return self._parse_json_object_text(raw_text)
+
+    @staticmethod
+    def _openai_message_content(payload: Dict[str, Any]) -> str:
+        try:
+            content = payload["choices"][0]["message"].get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                return "\n".join(parts)
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
+    def _parse_json_object_text(text: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        cleaned = text.strip()
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.S | re.I)
+        if fence:
+            cleaned = fence.group(1).strip()
+        if not cleaned.startswith("{"):
+            match = re.search(r"\{.*\}", cleaned, flags=re.S)
+            if match:
+                cleaned = match.group(0)
+        try:
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _falsey(value: Any) -> bool:
+        if isinstance(value, bool):
+            return not value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"0", "false", "no", "n", "off", "unsafe", "不安全", "否"}
 
     @staticmethod
     def _truthy(value: Any) -> bool:
@@ -1026,8 +1163,14 @@ class XWDrawPlugin(Star):
         msg_chain = [Plain(f"测试模式\n提示词: {prompt}\n")]
         if img_bytes:
             msg_chain.append(Plain("检测到图片输入，已成功获取图片数据。\n"))
-            if hasattr(Image, "fromBytes"):
-                msg_chain.append(Image.fromBytes(img_bytes))
+            if self._bool_conf("test_echo_image_enabled", False):
+                decision = await self._review_generated_asset(GeneratedAsset(image_bytes=img_bytes), event)
+                if decision.allowed and hasattr(Image, "fromBytes"):
+                    msg_chain.append(Image.fromBytes(img_bytes))
+                elif not decision.allowed:
+                    msg_chain.append(Plain(f"图片回显自审未通过，已停止回显（{decision.reason}）。"))
+            else:
+                msg_chain.append(Plain("测试图片回显默认关闭，仅确认已检测到图片。"))
         else:
             msg_chain.append(Plain("未检测到图片输入 (文生图模式)"))
         yield event.chain_result(msg_chain)

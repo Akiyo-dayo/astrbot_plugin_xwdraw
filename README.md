@@ -32,18 +32,24 @@ R18 自审默认开启：
 - `r18_block_r18`：是否拦截 R18，默认 `true`
 - `r18_block_r18g`：是否拦截 R18G，默认 `true`
 - `r18_nsfw_score_threshold`：`nsfw_score` 拦截阈值，默认 `0.65`
+- `r18_fail_without_metadata`：缺少 `nsfw_score/is_r18/is_r18g` 等自审 metadata 时是否保守拦截，默认 `true`
 - `r18_allowed_session_ids`：逗号分隔的放行会话列表，默认空
 
 外部审核默认关闭：
 
 - `external_review_enabled`：是否启用外部审核接口，默认 `false`
-- `external_review_api_url`：外部审核接口地址
+- `external_review_protocol`：外部审核协议，`auto/openai/custom`，默认 `auto`
+- `external_review_api_url`：外部审核接口地址；OpenAI 兼容中转站可填写 `https://example.com/v1`
 - `external_review_api_key`：外部审核 Bearer Token，可选
 - `external_review_model`：外部审核模型名，可选
 - `external_review_timeout`：外部审核超时，默认 `30`
+- `external_review_max_tokens`：OpenAI 兼容外审最大输出 Token，默认 `300`
 - `external_review_fail_closed`：外部审核失败时是否保守拦截，默认 `true`
+- `test_echo_image_enabled`：`测试来点` 是否允许回显输入图，默认 `false`
 
-外部审核接口期望返回 JSON 对象，例如：
+`external_review_protocol=auto` 时，如果地址以 `/v1` 或 `/chat/completions` 结尾，会自动使用 OpenAI-compatible Chat Completions：插件请求 `/chat/completions`，发送 `messages + image_url`，并从 `choices[0].message.content` 中解析 JSON。
+
+自定义外部审核接口或 OpenAI-compatible 模型回复都应给出 JSON 对象，例如：
 
 ```json
 {
@@ -53,6 +59,10 @@ R18 自审默认开启：
   "reason": "adult content"
 }
 ```
+
+其中 `score` 应表示不安全/NSFW 风险分，`0` 为安全、`1` 为高风险，不应表示“安全置信度”。
+
+外审返回非 JSON、空响应、HTML 或接口错误时，`external_review_fail_closed=true` 会拦截图片。若同时缺少服务端 metadata，`r18_fail_without_metadata=true` 也会拦截图片；关闭该策略会降低安全性。
 
 ## 图片生成
 
@@ -87,6 +97,8 @@ xwdraw <提示词>
 ```text
 测试来点 <提示词>
 ```
+
+`测试来点` 默认只提示已检测到图片，不回显原图，避免用户借测试命令绕过自审回传敏感图片。如开启 `test_echo_image_enabled`，回显前仍会执行同一套自审流程。
 
 ## 总开关
 

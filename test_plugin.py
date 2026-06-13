@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import types
@@ -228,6 +229,30 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         plugin.switch_state = {"session_overrides": {}}
         return plugin
 
+    async def start_openai_review_server(self, content, status=200):
+        calls = []
+
+        async def handle_review(request):
+            calls.append(
+                {
+                    "path": request.path,
+                    "auth": request.headers.get("Authorization"),
+                    "payload": await request.json(),
+                }
+            )
+            return web.json_response({"choices": [{"message": {"content": content}}]}, status=status)
+
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", handle_review)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        self.addAsyncCleanup(runner.cleanup)
+        sock = site._server.sockets[0]
+        host, port = sock.getsockname()[:2]
+        return f"http://{host}:{port}/v1", calls
+
     def test_url_helpers_encode_and_split_image_refs(self):
         client = main.XWDrawApiClient("https://sd.loping151.com/api/generate", "token", 5)
         url = client.image_url("20231215/测试 图片.png")
@@ -250,12 +275,79 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.level, "r18")
 
+    async def test_service_review_blocks_nested_r18_metadata(self):
+        plugin = self.make_plugin()
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={"metadata": {"is_r18g": True, "nsfw_score": 0.2}})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.level, "r18g")
+
     async def test_service_review_blocks_threshold(self):
         plugin = self.make_plugin()
         asset = main.GeneratedAsset(image_bytes=b"png", metadata={"nsfw_score": 0.9})
         decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
         self.assertFalse(decision.allowed)
         self.assertIn("nsfw_score", decision.reason)
+
+    async def test_service_review_blocks_nested_threshold(self):
+        plugin = self.make_plugin()
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={"metadata": {"nsfw_score": 0.9, "is_r18": False}})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "service_metadata")
+
+    async def test_review_blocks_when_metadata_missing_by_default(self):
+        plugin = self.make_plugin()
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "missing_metadata")
+
+    async def test_openai_external_review_safe_json_allows_without_metadata(self):
+        content = json.dumps({"safe": True, "level": "safe", "score": 0.0, "reason": "clean"})
+        api_url, calls = await self.start_openai_review_server(content)
+        plugin = self.make_plugin(
+            {
+                "external_review_enabled": True,
+                "external_review_api_url": api_url,
+                "external_review_api_key": "review-token",
+                "external_review_model": "vision-model",
+            }
+        )
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.source, "external_review")
+        self.assertEqual(calls[0]["path"], "/v1/chat/completions")
+        self.assertEqual(calls[0]["auth"], "Bearer review-token")
+        self.assertEqual(calls[0]["payload"]["model"], "vision-model")
+
+    async def test_openai_external_review_r18_json_blocks(self):
+        content = "```json\n" + json.dumps({"safe": False, "level": "r18", "score": 0.91, "reason": "adult"}) + "\n```"
+        api_url, _calls = await self.start_openai_review_server(content)
+        plugin = self.make_plugin({"external_review_enabled": True, "external_review_api_url": api_url})
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={"nsfw_score": 0.01})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "external_review")
+        self.assertEqual(decision.level, "r18")
+
+    async def test_openai_external_review_non_json_fail_closed_blocks(self):
+        api_url, _calls = await self.start_openai_review_server("not json")
+        plugin = self.make_plugin({"external_review_enabled": True, "external_review_api_url": api_url})
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={"nsfw_score": 0.01})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "external_review")
+        self.assertIn("没有返回 JSON", decision.reason)
+
+    async def test_openai_external_review_empty_content_fail_closed_blocks(self):
+        api_url, _calls = await self.start_openai_review_server("")
+        plugin = self.make_plugin({"external_review_enabled": True, "external_review_api_url": api_url})
+        asset = main.GeneratedAsset(image_bytes=b"png", metadata={"nsfw_score": 0.01})
+        decision = await plugin._review_generated_asset(asset, MockEvent("来点 test"))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.source, "external_review")
 
     async def test_generate_command_blocks_after_generation(self):
         plugin = self.make_plugin()
@@ -287,6 +379,19 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         plugin.client = FakeClient()
         results = await collect_asyncgen(plugin.on_generation_config(MockEvent("生成配置")))
         self.assertIn("models", results[0][1])
+
+    async def test_test_generate_does_not_echo_image_by_default(self):
+        plugin = self.make_plugin()
+
+        async def fake_image(_event, _timeout):
+            return b"input-image"
+
+        plugin._get_image_from_event = fake_image
+        results = await collect_asyncgen(plugin.on_test_generate(MockEvent("测试来点 probe")))
+        self.assertEqual(results[0][0], "chain")
+        chain = results[0][1]
+        self.assertFalse(any(isinstance(item, main.Image) for item in chain))
+        self.assertTrue(any(getattr(item, "text", "").find("回显默认关闭") >= 0 for item in chain))
 
     async def test_video_generate_command_uses_attached_image(self):
         plugin = self.make_plugin()

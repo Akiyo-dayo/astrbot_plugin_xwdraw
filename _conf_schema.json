@@ -59,6 +59,12 @@
         "hint": "当 metadata.nsfw_score 大于等于该阈值时拦截。默认 0.65。",
         "default": 0.65
     },
+    "r18_fail_without_metadata": {
+        "description": "缺少自审 metadata 时保守拦截",
+        "type": "bool",
+        "hint": "开启后，如果图片没有 nsfw_score/is_r18/is_r18g 等可用自审结果，且外部审核未给出安全结论，则不发送图片。默认开启。",
+        "default": true
+    },
     "r18_allowed_session_ids": {
         "description": "R18 放行会话列表",
         "type": "string",
@@ -68,13 +74,19 @@
     "external_review_enabled": {
         "description": "启用外部图片审核接口",
         "type": "bool",
-        "hint": "默认关闭。开启后会把生成图 base64 发送到 external_review_api_url，期望返回 safe/r18/r18g/score/reason。",
+        "hint": "默认关闭。开启后会把生成图 base64 发送到 external_review_api_url，期望返回 safe/r18/r18g/score/reason，或 OpenAI 兼容 chat completions。",
         "default": false
+    },
+    "external_review_protocol": {
+        "description": "外部审核协议",
+        "type": "string",
+        "hint": "auto/openai/custom。auto 会在地址为 /v1 或 /chat/completions 时使用 OpenAI 兼容格式。",
+        "default": "auto"
     },
     "external_review_api_url": {
         "description": "外部审核 API 地址",
         "type": "string",
-        "hint": "外部审核接口地址。未配置且启用外部审核时会按失败策略处理。",
+        "hint": "外部审核接口地址。OpenAI 兼容中转站可填写 https://example.com/v1，插件会请求 /chat/completions。",
         "default": ""
     },
     "external_review_api_key": {
@@ -95,10 +107,22 @@
         "hint": "外部审核接口的单次请求超时时间。",
         "default": 30
     },
+    "external_review_max_tokens": {
+        "description": "外部审核最大输出 Token",
+        "type": "int",
+        "hint": "OpenAI 兼容外审请求的 max_tokens，默认 300。",
+        "default": 300
+    },
     "external_review_fail_closed": {
         "description": "外部审核失败时保守拦截",
         "type": "bool",
         "hint": "开启后，外部审核启用但失败、未配置或无图时会拦截；关闭后只采用服务 metadata 结果。",
         "default": true
+    },
+    "test_echo_image_enabled": {
+        "description": "测试命令允许回显图片",
+        "type": "bool",
+        "hint": "默认关闭，避免“测试来点”绕过图片自审回传敏感图片。开启后回显前仍会执行自审。",
+        "default": false
     }
 }
