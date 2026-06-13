@@ -436,7 +436,7 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("图片元数据", bot_admin[0][1])
 
     async def test_sensitive_commands_require_bot_admin(self):
-        plugin = self.make_plugin()
+        plugin = self.make_plugin({"video_enabled": True})
         checks = [
             plugin.on_account(MockEvent("绘图账号", role="member")),
             plugin.on_generation_config(MockEvent("生成配置", role="member")),
@@ -518,7 +518,7 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("C:/secret", result[1])
 
     async def test_video_generate_command_uses_attached_image(self):
-        plugin = self.make_plugin()
+        plugin = self.make_plugin({"video_enabled": True})
         plugin.client = FakeClient()
 
         async def fake_image(_event, _timeout):
@@ -527,12 +527,13 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         plugin._get_image_from_event = fake_image
         results = await collect_asyncgen(plugin.on_video_generate(MockEvent("视频生成 spin camera -t 6 -fps 20 -n blurry")))
         self.assertIn("视频任务已提交", results[-1][1])
+        self.assertNotIn("{", results[-1][1])
         self.assertEqual(plugin.client.video_payload["duration"], "6")
         self.assertEqual(plugin.client.video_payload["fps"], "20")
         self.assertEqual(plugin.client.video_payload["negative_prompt"], "blurry")
 
     async def test_video_generate_command_parses_negative_before_other_flags(self):
-        plugin = self.make_plugin()
+        plugin = self.make_plugin({"video_enabled": True})
         plugin.client = FakeClient()
 
         async def fake_image(_event, _timeout):
@@ -545,7 +546,7 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.client.video_payload["negative_prompt"], "blurry")
 
     async def test_video_generate_reviews_source_image_before_submit(self):
-        plugin = self.make_plugin({"external_review_enabled": True, "external_review_api_url": ""})
+        plugin = self.make_plugin({"video_enabled": True, "external_review_enabled": True, "external_review_api_url": ""})
         plugin.client = FakeClient()
 
         async def fake_image(_event, _timeout):
@@ -558,7 +559,7 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin.client.video_payload)
 
     async def test_video_generate_rejects_invalid_fps_before_submit(self):
-        plugin = self.make_plugin({"r18_fail_without_metadata": False})
+        plugin = self.make_plugin({"video_enabled": True, "r18_fail_without_metadata": False})
         plugin.client = FakeClient()
 
         async def fake_image(_event, _timeout):
@@ -570,7 +571,7 @@ class XWDrawUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin.client.video_payload)
 
     async def test_video_generate_default_allows_source_image_without_metadata(self):
-        plugin = self.make_plugin()
+        plugin = self.make_plugin({"video_enabled": True})
         plugin.client = FakeClient()
 
         async def fake_image(_event, _timeout):

@@ -1,5 +1,5 @@
 name: astrbot_plugin_xwdraw
-desc: 对接小维远端 SD 绘图服务，支持图片/视频生成、预设、公告、推荐提示、群管总开关与 R18 自审
+desc: 对接小维远端 SD 绘图服务，支持图片/视频生成、预设、公告、推荐提示、群管总开关、视频分控开关与 R18 自审
 help: |
   来点 <提示词> - 文生图；附带图片时为图生图
   视频生成 <提示词> - 附带图片生成视频
@@ -8,6 +8,6 @@ help: |
   绘图开启 / 绘图关闭 / 绘图状态 - 群管理员控制当前群/会话总开关
   绘图帮助 - 按普通用户/群管理员/Bot管理员显示对应菜单
   配置方法：在插件配置页面填写 api_key、api_url、timeout，并按需配置自审和外部审核接口。
-version: v0.3.2
+version: v0.3.3
 author: Akiyo-dayo
 repo: https://github.com/Akiyo-dayo/astrbot_plugin_xwdraw

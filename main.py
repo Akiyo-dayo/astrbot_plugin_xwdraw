@@ -19,7 +19,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 DEFAULT_API_URL = "https://sd.loping151.com/api/generate"
-PLUGIN_VERSION = "0.3.2"
+PLUGIN_VERSION = "0.3.3"
 
 
 class XWDrawApiError(Exception):
@@ -574,6 +574,26 @@ class XWDrawPlugin(Star):
             return None
         return event.plain_result("本群/当前会话的绘图插件总开关已关闭。请联系群管理员发送 `绘图开启` 后再使用。")
 
+    def _video_disabled_result(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            return disabled
+        if not self._bool_conf("video_enabled", False):
+            return event.plain_result("视频功能总开关未开启。请在插件配置中将 video_enabled 设为 true。")
+        session_id = self._session_id(event)
+        overrides = self.switch_state.get("video_session_overrides", {})
+        if session_id and session_id in overrides and not overrides[session_id]:
+            return event.plain_result("当前会话的视频功能已关闭。")
+        return None
+
+    def _set_video_session_switch(self, event: AstrMessageEvent, enabled: bool):
+        session_id = self._session_id(event)
+        if not session_id:
+            raise XWDrawApiError("无法识别当前会话，不能保存视频开关状态。")
+        overrides = self.switch_state.setdefault("video_session_overrides", {})
+        overrides[session_id] = enabled
+        self._save_switch_state()
+
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
             return await value
@@ -1094,10 +1114,18 @@ class XWDrawPlugin(Star):
             return event.plain_result(f"生成完成，但自审判定为 {decision.level}，已停止发送图片（{decision.reason}{score_text}）。")
 
         caption = f"生成成功 ({asset.elapsed:.1f}s)"
-        if asset.final_prompt:
-            caption += f"\n实际提示词: {self._truncate(asset.final_prompt, 120)}"
         if asset.image_bytes:
-            return await self._send_image_bytes(event, asset.image_bytes, caption, asset.filename)
+            img_result = await self._send_image_bytes(event, asset.image_bytes, caption, asset.filename)
+            if asset.final_prompt:
+                try:
+                    nodes = [
+                        Node(uin=self._self_id(event), name="小千", content=[Plain(f"实际提示词:\n{asset.final_prompt}")]),
+                    ]
+                    prompt_result = event.chain_result([Nodes(nodes)])
+                    return [img_result, prompt_result]
+                except Exception as exc:
+                    logger.debug(f"转发实际提示词失败: {exc}")
+            return img_result
         return event.plain_result(f"生成完成 ({asset.elapsed:.1f}s)，但没有拿到可发送的图片数据。")
 
     async def _review_blocked_text(self, event: AstrMessageEvent, prefix: str, decision: ReviewDecision) -> str:
@@ -1247,6 +1275,34 @@ class XWDrawPlugin(Star):
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
+    @filter.command("视频开关", aliases={"视频开启", "视频关闭", "video_switch"}, prefix_optional=True)
+    async def on_video_switch(self, event: AstrMessageEvent):
+        action = self._parse_switch_action(event.message_str)
+        if action is None:
+            enabled = self._bool_conf("video_enabled", False)
+            session_id = self._session_id(event)
+            overrides = self.switch_state.get("video_session_overrides", {})
+            if session_id and session_id in overrides:
+                session_state = "开启" if overrides[session_id] else "关闭"
+                source = "当前会话设置"
+            else:
+                session_state = "开启" if enabled else "关闭"
+                source = "配置默认值"
+            yield event.plain_result(f"视频功能当前状态: {session_state} ({source})\n用法：视频开启 / 视频关闭")
+            return
+        if not await self._is_switch_admin(event):
+            yield event.plain_result("只有群管理员/群主或配置中的开关管理员可以修改视频开关。")
+            return
+        if not self._bool_conf("video_enabled", False):
+            yield event.plain_result("视频功能总开关未在插件配置中开启，无法设置会话级开关。请先将 video_enabled 设为 true。")
+            return
+        try:
+            self._set_video_session_switch(event, action)
+            state_text = "开启" if action else "关闭"
+            yield event.plain_result(f"已{state_text}当前群/会话的视频功能。")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
     @filter.command("测试来点", aliases={"test_xwdraw"}, prefix_optional=True)
     async def on_test_generate(self, event: AstrMessageEvent):
         disabled = self._disabled_result(event)
@@ -1310,7 +1366,12 @@ class XWDrawPlugin(Star):
                 asset.metadata["is_r18"] = True
             if args.is_r18g:
                 asset.metadata["is_r18g"] = True
-            yield await self._send_generated_asset(event, asset)
+            result = await self._send_generated_asset(event, asset)
+            if isinstance(result, list):
+                for item in result:
+                    yield item
+            else:
+                yield result
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
@@ -1762,7 +1823,7 @@ class XWDrawPlugin(Star):
 
     @filter.command("视频生成", aliases={"生成视频", "video_generate"}, prefix_optional=True)
     async def on_video_generate(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
+        disabled = self._video_disabled_result(event)
         if disabled:
             yield disabled
             return
@@ -1795,13 +1856,29 @@ class XWDrawPlugin(Star):
         try:
             yield event.plain_result("收到视频生成请求，正在提交任务。")
             data = await self._api().video_generate(image_bytes, prompt, negative_prompt=negative, duration=duration, fps=fps)
-            yield event.plain_result("视频任务已提交\n" + self._format_data(data))
+            yield event.plain_result(self._format_video_submit_result(data))
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
+    @staticmethod
+    def _format_video_submit_result(data: Any) -> str:
+        if not isinstance(data, dict):
+            return "视频任务已提交。"
+        status = data.get("status", "unknown")
+        ts = data.get("timestamp", "")
+        msg = data.get("message", "")
+        parts = ["视频任务已提交"]
+        if status:
+            parts.append(f"状态: {status}")
+        if ts:
+            parts.append(f"时间戳: {ts}")
+        if msg and msg != "Video generation queued":
+            parts.append(msg)
+        return "\n".join(parts)
+
     @filter.command("视频历史", aliases={"video_history"}, prefix_optional=True)
     async def on_video_history(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
+        disabled = self._video_disabled_result(event)
         if disabled:
             yield disabled
             return
@@ -1816,7 +1893,7 @@ class XWDrawPlugin(Star):
             yield await self._handle_api_error(event, exc)
 
     async def _handle_video_file(self, event: AstrMessageEvent, kind: str, image_like: bool):
-        disabled = self._disabled_result(event)
+        disabled = self._video_disabled_result(event)
         if disabled:
             yield disabled
             return
