@@ -1,12 +1,14 @@
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import re
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
@@ -19,7 +21,95 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 DEFAULT_API_URL = "https://sd.loping151.com/api/generate"
-PLUGIN_VERSION = "0.3.3"
+DEFAULT_TIMEOUT = 90
+PLUGIN_VERSION = "0.4.0"
+
+MAX_REFERENCE_IMAGES = 4
+
+# 服务端 /api/document/{name} 实际接受的名字（实测得到），以及能不能直接发到聊天里。
+# 「涩涩词条大全」就是 77MB 的 dictionary.txt，下载下来只会拖垮消息通道，改成给链接。
+DOCUMENTS = (
+    ("常规法典", "所长常规 NovalAI 个人法典 · docx 约 0.8MB", True),
+    ("色色法典", "所长色色 NovalAI 个人法典 · docx 约 1.4MB", True),
+    ("花花魔法书", "花花的魔法书 单人版 MS151 · docx 约 0.4MB", True),
+    ("涩涩词条大全", "全量词条字典 · txt 约 77MB，只给链接", False),
+)
+DOCUMENT_NAMES = tuple(name for name, _desc, _downloadable in DOCUMENTS)
+
+
+# ---------------------------------------------------------------------------
+# R18 / R18G 审核
+# ---------------------------------------------------------------------------
+#
+# 基于 sd.loping151.com 实测数据校准：
+#
+# - metadata 里的 is_r18 / is_r18g 是**用户生成时自己勾选的标记**，不是内容检测结果。
+#   实测存在提示词为「色图」但 is_r18=false、nsfw_score=0.997 的样本。
+#   所以这两个字段只能用来拦截，绝不能拿来证明一张图是安全的。
+# - metadata.nsfw_score 才是服务端真实的分类器输出。40 张样本的分布是：
+#   明确安全 0.000~0.480，泳装/比基尼等擦边 0.683~0.843，明确 R18 0.988~0.999。
+#   0.85 到 0.98 之间有一段干净的间隔，三档阈值就落在这段间隔的不同位置。
+# - 没有分数 = 未知，不等于安全。
+
+LEVEL_SAFE = "safe"
+LEVEL_R18 = "r18"
+LEVEL_R18G = "r18g"
+LEVEL_UNKNOWN = "unknown"
+
+POLICY_THRESHOLDS = {"strict": 0.80, "standard": 0.90, "loose": 0.97}
+DEFAULT_POLICY = "standard"
+
+# 提示词预筛词表：命中即认为用户在主动索取该类内容，可以在花掉额度之前拦下来。
+# ASCII 词按单词边界匹配，中文词按子串匹配。
+_R18_TERMS_EN = (
+    "nsfw", "hentai", "explicit", "porn", "porno", "pornography", "erotic",
+    "nude", "nudity", "naked", "topless", "bottomless", "undressing", "no panties",
+    "nipples", "nipple", "areolae", "areola", "pussy", "vagina", "vaginal", "vulva",
+    "clitoris", "penis", "testicles", "anus", "anal sex", "ass fuck",
+    "sex", "sexual intercourse", "fucked", "fucking", "gangbang", "bukkake",
+    "creampie", "cumshot", "ejaculation", "semen", "precum",
+    "fellatio", "blowjob", "cunnilingus", "paizuri", "titfuck", "footjob", "handjob",
+    "masturbation", "masturbating", "fingering", "orgasm", "ahegao", "squirting",
+    "futanari", "bestiality", "tentacle sex", "rape", "molestation",
+    "sex toy", "dildo", "vibrator", "buttplug", "lactation",
+    "spread pussy", "pussy juice", "after sex", "cum on body", "cum in pussy",
+)
+_R18_TERMS_ZH = (
+    "涩图", "色图", "涩涩", "瑟瑟", "黄图", "裸体", "全裸", "半裸", "脱衣", "无码",
+    "露点", "乳头", "乳首", "奶头", "阴部", "阴道", "阴茎", "私处",
+    "性交", "做爱", "口交", "足交", "乳交", "手淫", "自慰", "抽插",
+    "高潮", "潮吹", "精液", "内射", "中出", "颜射", "射精", "淫乱", "淫荡", "淫水",
+    "触手", "强奸", "轮奸", "凌辱", "肛交", "情趣内衣", "巨乳露出", "性爱", "发情",
+)
+_R18G_TERMS_EN = (
+    "guro", "gore", "gory", "disembowel", "disembowelment", "dismember",
+    "dismemberment", "decapitation", "decapitated", "beheading", "entrails",
+    "intestines", "eviscerate", "mutilation", "mutilated", "necrophilia",
+    "impalement", "torture", "snuff",
+)
+_R18G_TERMS_ZH = (
+    "猎奇", "血腥", "肢解", "碎尸", "断头", "内脏", "残肢", "剖腹", "开膛",
+    "分尸", "虐杀", "酷刑",
+)
+
+
+def _build_patterns(terms_en: Tuple[str, ...], terms_zh: Tuple[str, ...]) -> List[Tuple[re.Pattern, str]]:
+    patterns: List[Tuple[re.Pattern, str]] = []
+    for term in terms_en:
+        escaped = re.escape(term).replace(r"\ ", r"[\s_-]+")
+        patterns.append((re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", re.I), term))
+    for term in terms_zh:
+        patterns.append((re.compile(re.escape(term)), term))
+    return patterns
+
+
+R18_PATTERNS = _build_patterns(_R18_TERMS_EN, _R18_TERMS_ZH)
+R18G_PATTERNS = _build_patterns(_R18G_TERMS_EN, _R18G_TERMS_ZH)
+
+REVIEW_METADATA_KEYS = (
+    "is_r18", "is_r18g", "r18", "r18g", "nsfw", "nsfw_score", "score",
+    "status", "date_folder", "filename", "is_img2img", "nai_ref_mode",
+)
 
 
 class XWDrawApiError(Exception):
@@ -39,24 +129,176 @@ class GeneratedAsset:
     metadata: Dict[str, Any] = field(default_factory=dict)
     elapsed: float = 0.0
     final_prompt: Optional[str] = None
+    matches: Dict[str, Any] = field(default_factory=dict)
     raw_response: Any = None
 
 
 @dataclass
 class ReviewDecision:
+    """一次审核的结论。allowed=False 表示不得发送。"""
+
     allowed: bool
-    level: str = "safe"
+    level: str = LEVEL_SAFE
     source: str = "disabled"
     score: Optional[float] = None
     reason: str = ""
+    matched: List[str] = field(default_factory=list)
+
+    def detail(self) -> str:
+        parts = [f"判定={self.level}", f"来源={self.source}"]
+        if self.score is not None:
+            parts.append(f"score={self.score:.3f}")
+        if self.matched:
+            parts.append("命中=" + "/".join(self.matched[:5]))
+        if self.reason:
+            parts.append(self.reason)
+        return "，".join(parts)
+
+
+@dataclass
+class Allowance:
+    """当前会话被允许发送到什么级别的内容。"""
+
+    r18: bool = False
+    r18g: bool = False
+    source: str = "默认策略"
+
+    def allows(self, level: str) -> bool:
+        if level == LEVEL_R18G:
+            return self.r18g
+        # 未知等级来自「拿不到判定」，只有已经放行 R18 的会话才接受它。
+        if level in (LEVEL_R18, LEVEL_UNKNOWN):
+            return self.r18
+        return True
+
+    def describe(self) -> str:
+        return f"R18 {'✅' if self.r18 else '❌'} / R18G {'✅' if self.r18g else '❌'}（{self.source}）"
 
 
 @dataclass
 class GenerateArgs:
     prompt: str
-    denoising_strength: float = 0.7
+    denoising_strength: float = 0.6
     is_r18: bool = False
     is_r18g: bool = False
+    nai_ref_mode: str = "i2i"
+    uses_nai: bool = False
+
+
+def normalize_policy(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"off", "disabled", "none", "关闭", "关"}:
+        return "off"
+    if text in POLICY_THRESHOLDS:
+        return text
+    if text in {"严格"}:
+        return "strict"
+    if text in {"宽松"}:
+        return "loose"
+    if text in {"标准", "默认"}:
+        return "standard"
+    return DEFAULT_POLICY
+
+
+def scan_prompt(text: str, extra_r18: Optional[List[re.Pattern]] = None) -> Tuple[str, List[str]]:
+    """扫描提示词，返回 (级别, 命中词)。级别为 safe / r18 / r18g。"""
+    if not text:
+        return LEVEL_SAFE, []
+    gore = [term for pattern, term in R18G_PATTERNS if pattern.search(text)]
+    if gore:
+        return LEVEL_R18G, gore
+    adult = [term for pattern, term in R18_PATTERNS if pattern.search(text)]
+    for pattern in extra_r18 or []:
+        if pattern.search(text):
+            adult.append(pattern.pattern.replace("\\", ""))
+    if adult:
+        return LEVEL_R18, adult
+    return LEVEL_SAFE, []
+
+
+def flatten_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把 {"metadata": {...}} 这类嵌套结构摊平成一层，只保留审核关心的键。"""
+    if not isinstance(metadata, dict):
+        return {}
+    flat: Dict[str, Any] = {}
+    queue = [metadata]
+    visited = 0
+    while queue and visited < 8:
+        current = queue.pop(0)
+        visited += 1
+        if not isinstance(current, dict):
+            continue
+        for key, value in current.items():
+            if key in ("metadata", "image_metadata", "meta", "data") and isinstance(value, dict):
+                queue.append(value)
+                continue
+            if key in REVIEW_METADATA_KEYS and key not in flat:
+                flat[key] = value
+    return flat
+
+
+class ReviewLog:
+    """最近若干次审核记录，供管理员排查误判与漏判。"""
+
+    def __init__(self, maxlen: int = 60):
+        self.entries: Deque[Dict[str, Any]] = deque(maxlen=maxlen)
+
+    def add(self, session: str, sender: str, decision: ReviewDecision, filename: str = ""):
+        self.entries.append(
+            {
+                "time": time.strftime("%m-%d %H:%M:%S"),
+                "session": session or "未知会话",
+                "sender": sender or "未知用户",
+                "allowed": decision.allowed,
+                "level": decision.level,
+                "source": decision.source,
+                "score": decision.score,
+                "reason": decision.reason,
+                "filename": filename,
+            }
+        )
+
+    def recent(self, limit: int = 10) -> List[Dict[str, Any]]:
+        return list(self.entries)[-limit:][::-1]
+
+    def stats(self) -> Dict[str, int]:
+        blocked = sum(1 for entry in self.entries if not entry["allowed"])
+        return {"total": len(self.entries), "blocked": blocked, "passed": len(self.entries) - blocked}
+
+
+class DecisionCache:
+    """按图片内容哈希缓存审核结论，避免同一张图重复走外部审核。"""
+
+    def __init__(self, maxsize: int = 256):
+        self.maxsize = maxsize
+        self._data: "OrderedDict[str, ReviewDecision]" = OrderedDict()
+
+    @staticmethod
+    def key(image_bytes: Optional[bytes], *signature: Any) -> Optional[str]:
+        """缓存键必须覆盖全部判定输入，否则同一张图换了 metadata 会读到旧结论。"""
+        if not image_bytes:
+            return None
+        parts = "|".join(str(item) for item in signature)
+        return f"{hashlib.sha256(image_bytes).hexdigest()}:{parts}"
+
+    def get(self, key: Optional[str]) -> Optional[ReviewDecision]:
+        if not key or key not in self._data:
+            return None
+        self._data.move_to_end(key)
+        return self._data[key]
+
+    def put(self, key: Optional[str], decision: ReviewDecision):
+        if not key:
+            return
+        self._data[key] = decision
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# API 客户端
+# ---------------------------------------------------------------------------
 
 
 class XWDrawApiClient:
@@ -108,7 +350,6 @@ class XWDrawApiClient:
         *,
         params: Optional[Dict[str, Any]] = None,
         json_data: Any = None,
-        data: Any = None,
         auth: bool = True,
         headers: Optional[Dict[str, str]] = None,
     ) -> Any:
@@ -116,12 +357,7 @@ class XWDrawApiClient:
         req_headers = self._auth_headers(auth=auth, headers=headers)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
-                method,
-                self.endpoint_url(endpoint),
-                params=params,
-                json=json_data,
-                data=data,
-                headers=req_headers,
+                method, self.endpoint_url(endpoint), params=params, json=json_data, headers=req_headers
             ) as resp:
                 text = await resp.text()
                 payload = self._decode_json_text(text)
@@ -136,22 +372,17 @@ class XWDrawApiClient:
         *,
         params: Optional[Dict[str, Any]] = None,
         auth: bool = True,
-        headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[bytes, str]:
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        req_headers = self._auth_headers(auth=auth, headers=headers)
+        req_headers = self._auth_headers(auth=auth)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(
-                method,
-                self.endpoint_url(endpoint),
-                params=params,
-                headers=req_headers,
-            ) as resp:
+            async with session.request(method, self.endpoint_url(endpoint), params=params, headers=req_headers) as resp:
                 body = await resp.read()
                 if resp.status >= 400:
                     text = body.decode("utf-8", errors="replace")
-                    payload = self._decode_json_text(text)
-                    raise XWDrawApiError(self._error_message(payload, text, resp.status), resp.status, payload)
+                    raise XWDrawApiError(
+                        self._error_message(self._decode_json_text(text), text, resp.status), resp.status
+                    )
                 return body, resp.headers.get("Content-Type", "")
 
     async def fetch_url_bytes(self, url: str, *, auth: bool = False) -> bytes:
@@ -162,14 +393,14 @@ class XWDrawApiClient:
                 body = await resp.read()
                 if resp.status >= 400:
                     text = body.decode("utf-8", errors="replace")
-                    payload = self._decode_json_text(text)
-                    raise XWDrawApiError(self._error_message(payload, text, resp.status), resp.status, payload)
+                    raise XWDrawApiError(
+                        self._error_message(self._decode_json_text(text), text, resp.status), resp.status
+                    )
                 return body
 
     async def download_image(self, filename_or_url: str) -> Optional[bytes]:
-        attempts = self._download_attempts(filename_or_url)
         seen = set()
-        for url in attempts:
+        for url in self._download_attempts(filename_or_url):
             if not url or url in seen:
                 continue
             seen.add(url)
@@ -189,15 +420,13 @@ class XWDrawApiClient:
             unquoted = unquote(path)
             if root and unquoted != path:
                 attempts.append(f"{root}/{unquoted}")
-            encoded = self.encode_path_segments(unquoted)
             if root:
-                attempts.append(f"{root}/{encoded}")
-            parts = unquoted.split("/")
-            if root and parts:
-                attempts.append(f"{root}/{'/'.join(parts[:-1] + [quote(unquote(parts[-1]), safe='')])}")
+                attempts.append(f"{root}/{self.encode_path_segments(unquoted)}")
         except Exception:
             pass
         return attempts
+
+    # --- 生成 ---------------------------------------------------------------
 
     async def generate(self, payload: Dict[str, Any]) -> GeneratedAsset:
         timeout = aiohttp.ClientTimeout(total=self.timeout)
@@ -209,67 +438,177 @@ class XWDrawApiClient:
                 content_type = resp.headers.get("Content-Type", "").lower()
                 if resp.status == 200 and content_type.startswith("image/"):
                     return GeneratedAsset(image_bytes=await resp.read(), elapsed=elapsed)
-
                 text = await resp.text()
                 result = self._decode_json_text(text)
                 if resp.status >= 400:
                     raise XWDrawApiError(self._error_message(result, text, resp.status), resp.status, result)
-                asset = await self._asset_from_generation_result(result if result is not None else text, elapsed)
-                return asset
+                return await self._asset_from_generation_result(result if result is not None else text, elapsed)
 
     async def _asset_from_generation_result(self, result: Any, elapsed: float) -> GeneratedAsset:
         asset = GeneratedAsset(elapsed=elapsed, raw_response=result)
         if not isinstance(result, dict):
             return asset
 
-        asset.metadata = self._extract_metadata(result)
+        asset.metadata = flatten_metadata(result)
         asset.final_prompt = self._first_string(result, "final_prompt", "actual_prompt", "translated_prompt", "prompt")
+        if isinstance(result.get("matches"), dict):
+            asset.matches = result["matches"]
+
         image_b64 = self._first_string(result, "image_base64", "image_data", "base64")
         if image_b64:
             asset.image_bytes = self._decode_image_base64(image_b64)
 
         image_ref = self._first_string(result, "filename", "file", "url", "image_url", "path")
-        if image_ref:
-            asset.filename = image_ref
-            asset.url = self.image_url(image_ref)
-            asset.date_folder, filename = self.split_image_ref(image_ref)
-            if filename:
-                asset.filename = filename
-            if not asset.image_bytes:
-                asset.image_bytes = await self.download_image(image_ref)
-            if asset.date_folder and asset.filename:
-                try:
-                    metadata = await self.image_metadata(asset.date_folder, asset.filename)
-                    if isinstance(metadata, dict):
-                        asset.metadata.update(self._extract_metadata(metadata))
-                except Exception as exc:
-                    logger.debug(f"读取图片 metadata 失败: {exc}")
+        if not image_ref:
+            return asset
 
+        asset.url = self.image_url(image_ref)
+        asset.date_folder, asset.filename = self.split_image_ref(image_ref)
+        if not asset.image_bytes:
+            asset.image_bytes = await self.download_image(image_ref)
+        if asset.date_folder and asset.filename:
+            asset.metadata.update(await self.fetch_score_metadata(asset.date_folder, asset.filename))
         return asset
 
-    @staticmethod
-    def _extract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = {}
-        for key in ("metadata", "image_metadata", "meta"):
-            if isinstance(result.get(key), dict):
-                metadata.update(result[key])
-        for key in (
-            "is_r18",
-            "is_r18g",
-            "r18",
-            "r18g",
-            "nsfw",
-            "nsfw_score",
-            "score",
-            "status",
-            "user",
-            "username",
-            "date_folder",
-            "final_prompt",
-        ):
-            if key in result and key not in metadata:
-                metadata[key] = result[key]
-        return metadata
+    async def fetch_score_metadata(self, date_folder: str, filename: str, attempts: int = 3) -> Dict[str, Any]:
+        """拉取图片 metadata。nsfw_score 有可能比生成响应稍晚落库，所以带重试。"""
+        for attempt in range(attempts):
+            try:
+                payload = await self.image_metadata(date_folder, filename)
+                flat = flatten_metadata(payload if isinstance(payload, dict) else {})
+                if flat.get("nsfw_score") is not None or attempt == attempts - 1:
+                    return flat
+            except Exception as exc:
+                logger.debug(f"读取图片 metadata 失败 (第 {attempt + 1} 次): {exc}")
+            await asyncio.sleep(0.6 * (attempt + 1))
+        return {}
+
+    # --- 只读接口 -----------------------------------------------------------
+
+    async def verify(self) -> Any:
+        return await self.request_json("POST", "/api/verify")
+
+    async def version(self) -> Any:
+        return await self.request_json("GET", "/api/version", auth=False)
+
+    async def generation_config(self) -> Any:
+        return await self.request_json("GET", "/api/generation-config")
+
+    async def nai_config(self) -> Any:
+        return await self.request_json("GET", "/api/nai/config")
+
+    async def queue_status(self) -> Any:
+        return await self.request_json("GET", "/api/queue-status", auth=False)
+
+    async def announcements(self) -> Any:
+        return await self.request_json("GET", "/api/announcements", auth=False)
+
+    async def presets(self) -> Any:
+        return await self.request_json("GET", "/api/presets")
+
+    async def preset_detail(self, preset_type: str, preset_name: str) -> Any:
+        return await self.request_json(
+            "GET", f"/api/preset-detail/{quote(preset_type, safe='')}/{quote(preset_name, safe='')}"
+        )
+
+    async def preset_image(self, preset_type: str, image_name: str) -> Tuple[bytes, str]:
+        return await self.request_bytes(
+            "GET", f"/api/preset-image/{quote(preset_type, safe='')}/{quote(image_name, safe='')}"
+        )
+
+    async def costume_image(self, costume_name: str) -> Tuple[bytes, str]:
+        return await self.request_bytes("GET", f"/costume/{quote(costume_name, safe='')}")
+
+    async def recommended_prompts(self) -> Any:
+        return await self.request_json("GET", "/api/recommended-prompts")
+
+    async def user_presets(self) -> Any:
+        return await self.request_json("GET", "/api/user-presets")
+
+    async def add_user_preset(self, preset_name: str, preset_content: str) -> Any:
+        return await self.request_json(
+            "POST", "/api/user-presets", json_data={"preset_name": preset_name, "preset_content": preset_content}
+        )
+
+    async def delete_user_preset(self, preset_name: str) -> Any:
+        return await self.request_json("DELETE", f"/api/user-presets/{quote(preset_name, safe='')}")
+
+    async def recent_images(self, limit: int = 12, exclude_r18: bool = True, exclude_r18g: bool = True) -> Any:
+        return await self.request_json(
+            "GET",
+            "/api/recent-images",
+            params={
+                "limit": limit,
+                "exclude_r18": str(exclude_r18).lower(),
+                "exclude_r18g": str(exclude_r18g).lower(),
+            },
+        )
+
+    async def image_metadata(self, date_folder: str, filename: str) -> Any:
+        return await self.request_json(
+            "GET", f"/api/image-metadata/{quote(date_folder, safe='')}/{quote(filename, safe='')}"
+        )
+
+    async def thumbnail(self, date_folder: str, filename: str) -> Tuple[bytes, str]:
+        return await self.request_bytes(
+            "GET", f"/api/thumbnail/{quote(date_folder, safe='')}/{quote(filename, safe='')}"
+        )
+
+    async def update_image_tags(
+        self, date_folder: str, filename: str, is_r18: Optional[bool], is_r18g: Optional[bool]
+    ) -> Any:
+        body: Dict[str, Any] = {}
+        if is_r18 is not None:
+            body["is_r18"] = is_r18
+        if is_r18g is not None:
+            body["is_r18g"] = is_r18g
+        return await self.request_json(
+            "PUT", f"/api/image-tags/{quote(date_folder, safe='')}/{quote(filename, safe='')}", json_data=body
+        )
+
+    async def document(self, doc_name: str) -> Tuple[bytes, str]:
+        return await self.request_bytes("GET", f"/api/document/{quote(doc_name, safe='')}")
+
+    # --- 画廊 ---------------------------------------------------------------
+
+    async def gallery_request(self, method: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """画廊接口。Bearer 通常可直接访问，遇到 401/403 才回退到 /gallery/login 建会话。"""
+        try:
+            return await self.request_json(method, endpoint, params=params)
+        except XWDrawApiError as exc:
+            if exc.status not in (401, 403):
+                raise
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        headers = self._auth_headers()
+        async with aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.CookieJar()) as session:
+            async with session.post(self.endpoint_url("/gallery/login"), headers=headers) as login_resp:
+                login_text = await login_resp.text()
+                if login_resp.status >= 400:
+                    raise XWDrawApiError(
+                        self._error_message(self._decode_json_text(login_text), login_text, login_resp.status),
+                        login_resp.status,
+                    )
+            async with session.request(
+                method, self.endpoint_url(endpoint), params=params, headers=headers
+            ) as resp:
+                text = await resp.text()
+                payload = self._decode_json_text(text)
+                if resp.status >= 400:
+                    raise XWDrawApiError(self._error_message(payload, text, resp.status), resp.status, payload)
+                return payload if payload is not None else text
+
+    async def gallery_images(self, params: Dict[str, Any]) -> Any:
+        return await self.gallery_request("GET", "/gallery/images", params)
+
+    async def gallery_filters(self) -> Any:
+        return await self.gallery_request("GET", "/gallery/filters")
+
+    async def gallery_delete_image(self, date_folder: str, filename: str) -> Any:
+        return await self.gallery_request(
+            "DELETE", f"/gallery/image/{quote(date_folder, safe='')}/{quote(filename, safe='')}"
+        )
+
+    # --- 工具 ---------------------------------------------------------------
 
     @staticmethod
     def _first_string(data: Dict[str, Any], *keys: str) -> Optional[str]:
@@ -312,10 +651,7 @@ class XWDrawApiClient:
         try:
             if value.startswith("http://") or value.startswith("https://"):
                 path = unquote(urlparse(value).path)
-                if "/api/image/" in path:
-                    value = path.split("/api/image/", 1)[1]
-                else:
-                    value = path.strip("/")
+                value = path.split("/api/image/", 1)[1] if "/api/image/" in path else path.strip("/")
             value = unquote(value).strip("/")
             parts = value.split("/")
             if len(parts) >= 2:
@@ -324,125 +660,16 @@ class XWDrawApiClient:
         except Exception:
             return None, None
 
-    async def verify(self) -> Any:
-        return await self.request_json("POST", "/api/verify")
 
-    async def generation_config(self) -> Any:
-        return await self.request_json("GET", "/api/generation-config")
-
-    async def queue_status(self) -> Any:
-        return await self.request_json("GET", "/api/queue-status", auth=False)
-
-    async def announcements(self) -> Any:
-        return await self.request_json("GET", "/api/announcements", auth=False)
-
-    async def presets(self) -> Any:
-        return await self.request_json("GET", "/api/presets")
-
-    async def preset_detail(self, preset_type: str, preset_name: str) -> Any:
-        return await self.request_json("GET", f"/api/preset-detail/{quote(preset_type, safe='')}/{quote(preset_name, safe='')}")
-
-    async def preset_image(self, preset_type: str, image_name: str) -> Tuple[bytes, str]:
-        return await self.request_bytes("GET", f"/api/preset-image/{quote(preset_type, safe='')}/{quote(image_name, safe='')}")
-
-    async def user_presets(self) -> Any:
-        return await self.request_json("GET", "/api/user-presets")
-
-    async def add_user_preset(self, preset_name: str, preset_content: str) -> Any:
-        return await self.request_json(
-            "POST",
-            "/api/user-presets",
-            json_data={"preset_name": preset_name, "preset_content": preset_content},
-        )
-
-    async def delete_user_preset(self, preset_name: str) -> Any:
-        return await self.request_json("DELETE", f"/api/user-presets/{quote(preset_name, safe='')}")
-
-    async def recommended_prompts(self) -> Any:
-        return await self.request_json("GET", "/api/recommended-prompts")
-
-    async def recent_images(self, limit: int = 12, exclude_r18: bool = True, exclude_r18g: bool = True) -> Any:
-        return await self.request_json(
-            "GET",
-            "/api/recent-images",
-            params={"limit": limit, "exclude_r18": str(exclude_r18).lower(), "exclude_r18g": str(exclude_r18g).lower()},
-        )
-
-    async def image_metadata(self, date_folder: str, filename: str) -> Any:
-        return await self.request_json(
-            "GET",
-            f"/api/image-metadata/{quote(date_folder, safe='')}/{quote(filename, safe='')}",
-        )
-
-    async def update_image_tags(self, date_folder: str, filename: str, is_r18: Optional[bool], is_r18g: Optional[bool]) -> Any:
-        body: Dict[str, Any] = {}
-        if is_r18 is not None:
-            body["is_r18"] = is_r18
-        if is_r18g is not None:
-            body["is_r18g"] = is_r18g
-        return await self.request_json(
-            "PUT",
-            f"/api/image-tags/{quote(date_folder, safe='')}/{quote(filename, safe='')}",
-            json_data=body,
-        )
-
-    async def gallery_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        headers = self._auth_headers()
-        async with aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.CookieJar()) as session:
-            async with session.post(self.endpoint_url("/gallery/login"), headers=headers) as login_resp:
-                login_text = await login_resp.text()
-                login_payload = self._decode_json_text(login_text)
-                if login_resp.status >= 400:
-                    raise XWDrawApiError(self._error_message(login_payload, login_text, login_resp.status), login_resp.status, login_payload)
-            async with session.get(self.endpoint_url(endpoint), params=params, headers=headers) as resp:
-                text = await resp.text()
-                payload = self._decode_json_text(text)
-                if resp.status >= 400:
-                    raise XWDrawApiError(self._error_message(payload, text, resp.status), resp.status, payload)
-                return payload if payload is not None else text
-
-    async def video_generate(
-        self,
-        image_bytes: bytes,
-        prompt: str,
-        negative_prompt: str = "",
-        duration: str = "4",
-        fps: str = "16",
-    ) -> Any:
-        form = aiohttp.FormData()
-        form.add_field("file", image_bytes, filename="source.png", content_type="image/png")
-        form.add_field("prompt", prompt)
-        form.add_field("negative_prompt", negative_prompt)
-        form.add_field("duration", str(duration))
-        form.add_field("fps", str(fps))
-        return await self.request_json("POST", "/api/video/generate", data=form)
-
-    async def video_history(self) -> Any:
-        return await self.request_json("GET", "/api/video/history")
-
-    async def video_file(self, timestamp: str, username: str, kind: str = "video") -> Tuple[bytes, str]:
-        if kind == "thumbnail":
-            endpoint = f"/api/video/thumbnail/{quote(timestamp, safe='')}/{quote(username, safe='')}"
-        elif kind == "last-frame":
-            endpoint = f"/api/video/last-frame/{quote(timestamp, safe='')}/{quote(username, safe='')}"
-        elif kind == "source-image":
-            endpoint = f"/api/video/source-image/{quote(timestamp, safe='')}/{quote(username, safe='')}"
-        else:
-            endpoint = f"/api/video/{quote(timestamp, safe='')}/{quote(username, safe='')}"
-        return await self.request_bytes("GET", endpoint)
-
-    async def document(self, doc_name: str) -> Tuple[bytes, str]:
-        return await self.request_bytes("GET", f"/api/document/{quote(doc_name, safe='')}")
-
-    async def costume_image(self, costume_name: str) -> Tuple[bytes, str]:
-        return await self.request_bytes("GET", f"/costume/{quote(costume_name, safe='')}")
+# ---------------------------------------------------------------------------
+# 插件本体
+# ---------------------------------------------------------------------------
 
 
 @register(
     "astrbot_plugin_xwdraw",
     "xwdraw",
-    "集成小维远端 SD 绘图服务，支持图片/视频生成、预设、画廊、公告、队列和 R18 自审",
+    "对接小维远端 SD/NovelAI 绘图服务：文生图、图生图、NAI 参考图、预设、画廊与分级 R18 审核",
     PLUGIN_VERSION,
     "https://github.com/Akiyo-dayo/astrbot_plugin_xwdraw",
 )
@@ -456,13 +683,18 @@ class XWDrawPlugin(Star):
         self.cache_duration = 300
         self.switch_state_path = self.plugin_data_dir / "switches.json"
         self.switch_state = self._load_switch_state()
+        self.review_log = ReviewLog()
+        self.review_cache = DecisionCache()
         self.client = self._build_client()
 
     async def initialize(self):
         logger.info(
             f"astrbot_plugin_xwdraw v{PLUGIN_VERSION} 已加载, "
-            f"api_url={self._conf('api_url', DEFAULT_API_URL)}, timeout={self._conf('timeout', 60)}s"
+            f"api_url={self._conf('api_url', DEFAULT_API_URL)}, "
+            f"版本形态={self._edition_label()}, R18 策略={self._policy()}"
         )
+
+    # --- 配置读取 -----------------------------------------------------------
 
     def _resolve_data_dir(self) -> Path:
         try:
@@ -479,7 +711,7 @@ class XWDrawPlugin(Star):
         return XWDrawApiClient(
             api_url=str(self._conf("api_url", DEFAULT_API_URL)),
             api_key=str(self._conf("api_key", "")),
-            timeout=self._int_conf("timeout", 60),
+            timeout=self._int_conf("timeout", DEFAULT_TIMEOUT),
         )
 
     def _api(self) -> XWDrawApiClient:
@@ -515,7 +747,68 @@ class XWDrawPlugin(Star):
         value = self._conf(key, [])
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
-        return [item.strip() for item in str(value or "").split(",") if item.strip()]
+        return [item.strip() for item in str(value or "").replace("，", ",").split(",") if item.strip()]
+
+    # --- 版本形态与 R18 放行 -------------------------------------------------
+
+    def _is_custom_edition(self) -> bool:
+        return str(self._conf("edition", "shared")).strip().lower() in {"custom", "定制版", "custom_edition"}
+
+    def _edition_label(self) -> str:
+        return "定制版" if self._is_custom_edition() else "共用版"
+
+    def _policy(self) -> str:
+        return normalize_policy(self._conf("r18_policy", DEFAULT_POLICY))
+
+    def _score_threshold(self) -> float:
+        override = self._float_conf("r18_nsfw_score_threshold", 0.0)
+        if override > 0:
+            return override
+        return POLICY_THRESHOLDS.get(self._policy(), POLICY_THRESHOLDS[DEFAULT_POLICY])
+
+    def _extra_block_patterns(self) -> List[re.Pattern]:
+        return [re.compile(re.escape(item), re.I) for item in self._list_conf("r18_extra_blocklist")]
+
+    def _allowance(self, event: Optional[AstrMessageEvent]) -> Allowance:
+        """决定当前会话可以放行到哪一级。优先级：会话指令 > 版本形态 > 白名单 > 默认全拦。"""
+        session_id = self._session_id(event) if event else ""
+        override = self._r18_overrides().get(session_id) if session_id else None
+        if isinstance(override, dict):
+            return Allowance(bool(override.get("r18")), bool(override.get("r18g")), "本会话设置")
+
+        if self._is_custom_edition():
+            return Allowance(
+                self._bool_conf("custom_edition_allow_r18", True),
+                self._bool_conf("custom_edition_allow_r18g", False),
+                "定制版默认",
+            )
+
+        # 名单只放行 R18；R18G 必须由管理员在群里显式发「R18开启 含G」。
+        if session_id and session_id in self._list_conf("r18_allowed_session_ids"):
+            return Allowance(True, False, "放行会话名单")
+
+        return Allowance(False, False, "共用版默认")
+
+    def _r18_overrides(self) -> Dict[str, Any]:
+        overrides = self.switch_state.setdefault("r18_overrides", {})
+        if not isinstance(overrides, dict):
+            overrides = {}
+            self.switch_state["r18_overrides"] = overrides
+        return overrides
+
+    def _set_r18_override(self, event: AstrMessageEvent, allow_r18: bool, allow_r18g: bool):
+        session_id = self._session_id(event)
+        if not session_id:
+            raise XWDrawApiError("无法识别当前会话，不能保存 R18 放行状态。")
+        self._r18_overrides()[session_id] = {"r18": allow_r18, "r18g": allow_r18g}
+        self._save_switch_state()
+
+    def _clear_r18_override(self, event: AstrMessageEvent):
+        session_id = self._session_id(event)
+        self._r18_overrides().pop(session_id, None)
+        self._save_switch_state()
+
+    # --- 总开关持久化 -------------------------------------------------------
 
     def _load_switch_state(self) -> Dict[str, Any]:
         try:
@@ -523,15 +816,18 @@ class XWDrawPlugin(Star):
                 data = json.loads(self.switch_state_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     data.setdefault("session_overrides", {})
+                    data.setdefault("r18_overrides", {})
                     return data
         except Exception as exc:
             logger.warning(f"读取绘图开关状态失败: {exc}")
-        return {"session_overrides": {}}
+        return {"session_overrides": {}, "r18_overrides": {}}
 
     def _save_switch_state(self):
         try:
             self.switch_state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.switch_state_path.write_text(json.dumps(self.switch_state, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.switch_state_path.write_text(
+                json.dumps(self.switch_state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         except Exception as exc:
             logger.warning(f"保存绘图开关状态失败: {exc}")
 
@@ -549,19 +845,6 @@ class XWDrawPlugin(Star):
             return bool(overrides[session_id])
         return self._bool_conf("plugin_enabled", True)
 
-    def _switch_status_text(self, event: AstrMessageEvent) -> str:
-        session_id = self._session_id(event) or "unknown"
-        overrides = self._session_switch_overrides()
-        if session_id in overrides:
-            source = "当前会话设置"
-            enabled = bool(overrides[session_id])
-        else:
-            source = "配置默认值"
-            enabled = self._bool_conf("plugin_enabled", True)
-        default_text = "开启" if self._bool_conf("plugin_enabled", True) else "关闭"
-        current_text = "开启" if enabled else "关闭"
-        return f"绘图总开关：{current_text}\n作用范围：当前会话/群 ({session_id})\n状态来源：{source}\n配置默认：{default_text}"
-
     def _set_session_switch(self, event: AstrMessageEvent, enabled: bool):
         session_id = self._session_id(event)
         if not session_id:
@@ -572,32 +855,12 @@ class XWDrawPlugin(Star):
     def _disabled_result(self, event: AstrMessageEvent):
         if self._is_plugin_enabled_for_event(event):
             return None
-        return event.plain_result("本群/当前会话的绘图插件总开关已关闭。请联系群管理员发送 `绘图开启` 后再使用。")
+        return event.plain_result("本群/当前会话的绘图总开关已关闭。请联系群管理员发送「绘图开启」后再使用。")
 
-    def _video_disabled_result(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            return disabled
-        if not self._bool_conf("video_enabled", False):
-            return event.plain_result("视频功能总开关未开启。请在插件配置中将 video_enabled 设为 true。")
-        session_id = self._session_id(event)
-        overrides = self.switch_state.get("video_session_overrides", {})
-        if session_id and session_id in overrides and not overrides[session_id]:
-            return event.plain_result("当前会话的视频功能已关闭。")
-        return None
-
-    def _set_video_session_switch(self, event: AstrMessageEvent, enabled: bool):
-        session_id = self._session_id(event)
-        if not session_id:
-            raise XWDrawApiError("无法识别当前会话，不能保存视频开关状态。")
-        overrides = self.switch_state.setdefault("video_session_overrides", {})
-        overrides[session_id] = enabled
-        self._save_switch_state()
+    # --- 身份识别 -----------------------------------------------------------
 
     async def _maybe_await(self, value: Any) -> Any:
-        if inspect.isawaitable(value):
-            return await value
-        return value
+        return await value if inspect.isawaitable(value) else value
 
     def _sender_id(self, event: AstrMessageEvent) -> str:
         for method in ("get_sender_id", "get_user_id"):
@@ -630,9 +893,7 @@ class XWDrawPlugin(Star):
 
     @staticmethod
     def _get_attr_or_key(obj: Any, key: str) -> Any:
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
 
     def _sender_role_values(self, event: AstrMessageEvent) -> List[str]:
         values: List[str] = []
@@ -642,8 +903,7 @@ class XWDrawPlugin(Star):
                 if value:
                     values.append(str(value).strip().lower())
             for attr in ("is_admin", "admin", "is_owner", "owner"):
-                value = self._get_attr_or_key(obj, attr)
-                if self._truthy(value):
+                if self._truthy(self._get_attr_or_key(obj, attr)):
                     values.append("admin")
         return values
 
@@ -664,138 +924,13 @@ class XWDrawPlugin(Star):
         sender_id = self._sender_id(event)
         if sender_id and sender_id in self._list_conf("switch_admin_user_ids"):
             return True
-
         if await self._is_bot_admin(event):
             return True
-
         if self._bool_conf("group_admin_can_toggle", True):
             roles = set(self._sender_role_values(event))
             if roles.intersection({"owner", "admin", "administrator", "群主", "管理员"}):
                 return True
         return False
-
-    def _is_r18_allowed_session(self, event: AstrMessageEvent) -> bool:
-        return self._session_id(event) in self._list_conf("r18_allowed_session_ids")
-
-    @staticmethod
-    def _has_sensitive_flag(text_or_tokens: Any) -> bool:
-        if isinstance(text_or_tokens, str):
-            text = text_or_tokens
-        else:
-            text = " ".join(str(token) for token in text_or_tokens)
-        return bool(re.search(r"(^|\s)--(?:r18g?|all)(\s|$)", text, flags=re.I))
-
-    def _sensitive_content_denied_result(self, event: AstrMessageEvent):
-        return event.plain_result("当前会话不允许生成或查看该类型内容，已取消请求。")
-
-    @staticmethod
-    def _parse_switch_action(raw: str) -> Optional[bool]:
-        tokens = raw.strip().split()
-        command = tokens[0] if tokens else ""
-        if any(word in command for word in ("开启", "打开", "启用")):
-            return True
-        if any(word in command for word in ("关闭", "禁用", "停止")):
-            return False
-        if len(tokens) < 2:
-            return None
-        value = tokens[1].strip().lower()
-        if value in {"开", "开启", "打开", "启用", "on", "enable", "enabled", "true", "1"}:
-            return True
-        if value in {"关", "关闭", "禁用", "停止", "off", "disable", "disabled", "false", "0"}:
-            return False
-        return None
-
-    @staticmethod
-    def parse_generate_args(prompt_line: str) -> GenerateArgs:
-        text = prompt_line.strip()
-        is_r18g = bool(re.search(r"(^|\s)--r18g(\s|$)", text, flags=re.I))
-        is_r18 = bool(re.search(r"(^|\s)--r18(\s|$)", text, flags=re.I)) or is_r18g
-        text = re.sub(r"(^|\s)--r18g(\s|$)", " ", text, flags=re.I)
-        text = re.sub(r"(^|\s)--r18(\s|$)", " ", text, flags=re.I)
-
-        denoise = 0.7
-        match = re.search(r"(?:^|\s)-d\s*([0-9]*\.?[0-9]+)", text)
-        if match:
-            try:
-                denoise = max(0.0, min(1.0, float(match.group(1))))
-            except Exception:
-                denoise = 0.7
-            text = re.sub(r"(?:^|\s)-d\s*[0-9]*\.?[0-9]+", " ", text, count=1)
-
-        return GenerateArgs(prompt=re.sub(r"\s+", " ", text).strip(), denoising_strength=denoise, is_r18=is_r18, is_r18g=is_r18g)
-
-    async def _fetch_image_bytes(self, url_or_path: str, timeout: int, headers: Optional[Dict[str, str]] = None) -> Optional[bytes]:
-        try:
-            if not url_or_path:
-                return None
-            value = str(url_or_path)
-            if value.startswith("file://"):
-                parsed_path = unquote(urlparse(value).path)
-                if re.match(r"^/[A-Za-z]:/", parsed_path):
-                    parsed_path = parsed_path[1:]
-                value = parsed_path
-            if Path(value).is_file():
-                return Path(value).read_bytes()
-            if value.startswith("http"):
-                timeout_obj = aiohttp.ClientTimeout(total=timeout)
-                async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                    async with session.get(value, headers=headers) as resp:
-                        resp.raise_for_status()
-                        return await resp.read()
-        except Exception as exc:
-            logger.warning(f"_fetch_image_bytes 失败: {exc}")
-        return None
-
-    async def _get_image_from_event(self, event: AstrMessageEvent, timeout: int) -> Optional[bytes]:
-        segments = getattr(getattr(event, "message_obj", None), "message", []) or []
-        for seg in segments:
-            if isinstance(seg, Reply) and getattr(seg, "chain", None):
-                for child in seg.chain:
-                    image_bytes = await self._image_segment_bytes(child, timeout)
-                    if image_bytes:
-                        return image_bytes
-        for seg in segments:
-            image_bytes = await self._image_segment_bytes(seg, timeout)
-            if image_bytes:
-                return image_bytes
-        return None
-
-    async def _image_segment_bytes(self, seg: Any, timeout: int) -> Optional[bytes]:
-        if not isinstance(seg, Image):
-            return None
-        data = getattr(seg, "data", None)
-        if isinstance(data, bytes):
-            return data
-        if isinstance(data, str):
-            decoded = XWDrawApiClient._decode_image_base64(data)
-            if decoded:
-                return decoded
-        image_src = getattr(seg, "url", None) or getattr(seg, "file", None) or getattr(seg, "path", None)
-        return await self._fetch_image_bytes(str(image_src), timeout) if image_src else None
-
-    def _build_image_url(self, api_url: str, filename: str) -> str:
-        return XWDrawApiClient(api_url=api_url, api_key="", timeout=60).image_url(filename)
-
-    async def _download_with_fallbacks(self, url: str, timeout: int, api_key: Optional[str] = None) -> Optional[bytes]:
-        return await XWDrawApiClient(self._conf("api_url", DEFAULT_API_URL), api_key or self._conf("api_key", ""), timeout).download_image(url)
-
-    async def _get_presets(self, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
-        current_time = time.time()
-        if not force_refresh and self.presets_cache and (current_time - self.cache_time < self.cache_duration):
-            return self.presets_cache
-        try:
-            presets = await self._api().presets()
-            if isinstance(presets, dict):
-                self.presets_cache = presets
-                self.cache_time = current_time
-                return presets
-        except Exception as exc:
-            logger.error(f"获取预设失败: {exc}")
-        return None
-
-    async def _api_request(self, method: str, endpoint: str, **kwargs) -> Any:
-        json_data = kwargs.pop("json", None)
-        return await self._api().request_json(method, endpoint, json_data=json_data, **kwargs)
 
     def _session_id(self, event: AstrMessageEvent) -> str:
         for attr in ("unified_msg_origin", "session_id"):
@@ -813,88 +948,115 @@ class XWDrawPlugin(Star):
         except Exception:
             return "0"
 
-    async def _review_generated_asset(self, asset: GeneratedAsset, event: Optional[AstrMessageEvent] = None) -> ReviewDecision:
-        if not self._bool_conf("r18_review_enabled", True):
-            return ReviewDecision(True, source="disabled", reason="审查已关闭")
+    # --- 审核核心 -----------------------------------------------------------
 
-        if event and self._session_id(event) in self._list_conf("r18_allowed_session_ids"):
-            return ReviewDecision(True, source="allowed_session", reason="当前会话在放行列表中")
+    async def review_asset(
+        self, asset: GeneratedAsset, event: Optional[AstrMessageEvent] = None, prompt_level: str = LEVEL_SAFE
+    ) -> ReviewDecision:
+        """对准备发送的图片做分级审核。
 
-        asset.metadata = self._flatten_review_metadata(asset.metadata)
-        service_decision = self._review_service_metadata(asset.metadata)
-        if not service_decision.allowed:
-            return service_decision
+        判定顺序刻意把「自述标记」和「分类器分数」分开：自述标记只用于拦截，
+        分数才是放行依据，两者都拿不到时是 unknown 而不是 safe。
+        """
+        policy = self._policy()
+        if policy == "off":
+            return ReviewDecision(True, source="policy_off", reason="R18 审核已关闭")
 
+        allowance = self._allowance(event)
+        threshold = self._score_threshold()
+        flat = flatten_metadata(asset.metadata)
+        cache_key = DecisionCache.key(
+            asset.image_bytes,
+            policy,
+            threshold,
+            allowance.r18,
+            allowance.r18g,
+            prompt_level,
+            flat.get("is_r18"),
+            flat.get("is_r18g"),
+            flat.get("nsfw_score"),
+        )
+        decision = self.review_cache.get(cache_key)
+        if decision is None:
+            decision = await self._decide(asset, allowance, threshold, prompt_level)
+            self.review_cache.put(cache_key, decision)
+
+        # 命中缓存也要记一笔：审计关心的是「谁在哪个会话触发了这次判定」，不是判定算了几次。
+        session = self._session_id(event) if event else ""
+        sender = self._sender_id(event) if event else ""
+        self.review_log.add(session, sender, decision, asset.filename or "")
+        if not decision.allowed:
+            logger.warning(
+                f"图片已拦截: {decision.detail()}, session={session}, sender={sender}, filename={asset.filename}"
+            )
+        return decision
+
+    async def _decide(
+        self, asset: GeneratedAsset, allowance: Allowance, threshold: float, prompt_level: str
+    ) -> ReviewDecision:
+        flat = flatten_metadata(asset.metadata)
+        score = self._float_value(flat.get("nsfw_score", flat.get("score")))
+        declared_r18g = self._truthy(flat.get("is_r18g", flat.get("r18g")))
+        declared_r18 = self._truthy(flat.get("is_r18", flat.get("r18", flat.get("nsfw"))))
+
+        # 1) 自述标记：只能拦截，不能放行。
+        if declared_r18g and not allowance.allows(LEVEL_R18G):
+            return ReviewDecision(False, LEVEL_R18G, "metadata_flag", score, "图片被标记为 R18G")
+        if declared_r18 and not allowance.allows(LEVEL_R18):
+            return ReviewDecision(False, LEVEL_R18, "metadata_flag", score, "图片被标记为 R18")
+
+        # 2) 提示词预筛结论同样是硬信号。
+        if prompt_level == LEVEL_R18G and not allowance.allows(LEVEL_R18G):
+            return ReviewDecision(False, LEVEL_R18G, "prompt_scan", score, "提示词命中 R18G 词条")
+        if prompt_level == LEVEL_R18 and not allowance.allows(LEVEL_R18):
+            return ReviewDecision(False, LEVEL_R18, "prompt_scan", score, "提示词命中 R18 词条")
+
+        # 3) 服务端分类器分数。
+        if score is not None and score >= threshold and not allowance.allows(LEVEL_R18):
+            return ReviewDecision(
+                False, LEVEL_R18, "nsfw_score", score, f"nsfw_score={score:.3f} ≥ 阈值 {threshold:.2f}"
+            )
+
+        # 4) 外部视觉审核：作为额外一道关，也可以给出「安全」结论来补上缺失的分数。
         if self._bool_conf("external_review_enabled", False):
-            external = await self._external_review(asset.image_bytes, asset.metadata)
-            if not external.allowed:
+            external = await self._external_review(asset.image_bytes, flat)
+            if not external.allowed and not allowance.allows(external.level):
                 return external
             if external.source == "external_review":
-                return external
+                return ReviewDecision(True, external.level, "external_review", external.score, external.reason)
 
-        if not self._has_review_metadata(asset.metadata) and self._bool_conf("r18_fail_without_metadata", True):
-            return ReviewDecision(False, level="unknown", source="missing_metadata", reason="图片缺少可用自审 metadata，按安全策略拦截")
+        # 5) 既没有分数也没有外审结论 —— 未知，按配置决定是否保守拦截。
+        if score is None:
+            if self._bool_conf("r18_block_without_score", True) and not allowance.allows(LEVEL_R18):
+                return ReviewDecision(
+                    False, LEVEL_UNKNOWN, "missing_score", None, "拿不到 nsfw_score，按保守策略不发送"
+                )
+            return ReviewDecision(True, LEVEL_UNKNOWN, "missing_score", None, "缺少分数但按配置放行")
 
-        return service_decision
+        # 走到这里分数若仍然超阈值，说明是被会话放行的，审核记录要如实写成 r18。
+        if score >= threshold:
+            return ReviewDecision(
+                True, LEVEL_R18, "nsfw_score", score, f"nsfw_score={score:.3f} ≥ 阈值 {threshold:.2f}，当前会话已放行"
+            )
+        return ReviewDecision(True, LEVEL_SAFE, "nsfw_score", score, f"nsfw_score={score:.3f} < 阈值 {threshold:.2f}")
 
-    async def _review_input_image(self, image_bytes: bytes, event: Optional[AstrMessageEvent] = None) -> ReviewDecision:
-        if not self._bool_conf("r18_review_enabled", True):
-            return ReviewDecision(True, source="disabled", reason="审查已关闭")
-
-        if event and self._session_id(event) in self._list_conf("r18_allowed_session_ids"):
-            return ReviewDecision(True, source="allowed_session", reason="当前会话在放行列表中")
-
-        if self._bool_conf("external_review_enabled", False):
-            return await self._external_review(image_bytes, {})
-
-        return ReviewDecision(True, level="unknown", source="input_image_review", reason="未启用外部审核，输入图仅在生成后继续审查")
-
-    def _review_service_metadata(self, metadata: Dict[str, Any]) -> ReviewDecision:
-        metadata = self._flatten_review_metadata(metadata)
-        block_r18 = self._bool_conf("r18_block_r18", True)
-        block_r18g = self._bool_conf("r18_block_r18g", True)
-        threshold = self._float_conf("r18_nsfw_score_threshold", 0.65)
-        is_r18 = self._truthy(metadata.get("is_r18", metadata.get("r18", metadata.get("nsfw"))))
-        is_r18g = self._truthy(metadata.get("is_r18g", metadata.get("r18g")))
-        score = self._float_value(metadata.get("nsfw_score", metadata.get("score")))
-
-        if block_r18g and is_r18g:
-            return ReviewDecision(False, level="r18g", source="service_metadata", score=score, reason="服务 metadata 标记为 R18G")
-        if block_r18 and is_r18:
-            return ReviewDecision(False, level="r18", source="service_metadata", score=score, reason="服务 metadata 标记为 R18")
-        if score is not None and score >= threshold:
-            return ReviewDecision(False, level="r18", source="service_metadata", score=score, reason=f"nsfw_score={score:.3f} 超过阈值 {threshold:.3f}")
-        return ReviewDecision(True, level="safe", source="service_metadata", score=score, reason="metadata 未触发拦截")
-
-    @staticmethod
-    def _flatten_review_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not isinstance(metadata, dict):
-            return {}
-        flat = dict(metadata)
-        for key in ("metadata", "image_metadata", "meta", "data"):
-            nested = flat.get(key)
-            if isinstance(nested, dict):
-                flat.update(XWDrawApiClient._extract_metadata(nested))
-        return XWDrawApiClient._extract_metadata(flat)
-
-    def _has_review_metadata(self, metadata: Dict[str, Any]) -> bool:
-        flat = self._flatten_review_metadata(metadata)
-        for key in ("is_r18", "is_r18g", "r18", "r18g", "nsfw", "nsfw_score", "score"):
-            if key in flat and flat.get(key) not in (None, ""):
-                return True
-        return False
+    async def review_local_image(self, image_bytes: bytes, event: Optional[AstrMessageEvent] = None) -> ReviewDecision:
+        """审核不是本服务生成、因此没有 nsfw_score 的图片（预设图、服装图、输入图）。"""
+        return await self.review_asset(GeneratedAsset(image_bytes=image_bytes), event)
 
     async def _external_review(self, image_bytes: Optional[bytes], metadata: Dict[str, Any]) -> ReviewDecision:
-        if not image_bytes:
-            if self._bool_conf("external_review_fail_closed", True):
-                return ReviewDecision(False, level="unknown", source="external_review", reason="外部审核启用但没有图片数据")
-            return ReviewDecision(True, source="external_review_error", reason="无图片数据，按配置放行")
+        fail_closed = self._bool_conf("external_review_fail_closed", True)
 
+        def unavailable(reason: str) -> ReviewDecision:
+            if fail_closed:
+                return ReviewDecision(False, LEVEL_UNKNOWN, "external_review", None, reason)
+            return ReviewDecision(True, LEVEL_UNKNOWN, "external_review_skipped", None, f"{reason}（按配置放行）")
+
+        if not image_bytes:
+            return unavailable("外部审核启用但没有图片数据")
         api_url = str(self._conf("external_review_api_url", "") or "").strip()
         if not api_url:
-            if self._bool_conf("external_review_fail_closed", True):
-                return ReviewDecision(False, level="unknown", source="external_review", reason="外部审核启用但未配置接口地址")
-            return ReviewDecision(True, source="external_review_error", reason="未配置外部审核接口，按配置放行")
+            return unavailable("外部审核启用但未配置接口地址")
 
         protocol = self._external_review_protocol(api_url)
         image_data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("utf-8")
@@ -921,33 +1083,43 @@ class XWDrawPlugin(Star):
                     text = await resp.text()
                     result = self._extract_external_review_payload(XWDrawApiClient._decode_json_text(text), text)
                     if resp.status >= 400:
-                        raise XWDrawApiError(f"外部审核接口返回 HTTP {resp.status}: {text[:300]}", resp.status, result)
+                        raise XWDrawApiError(f"外部审核接口返回 HTTP {resp.status}: {text[:300]}", resp.status)
                     if not isinstance(result, dict):
                         raise XWDrawApiError("外部审核接口没有返回 JSON 对象")
                     return self._decision_from_external_payload(result)
         except Exception as exc:
             logger.warning(f"外部审核失败: {exc}")
-            if self._bool_conf("external_review_fail_closed", True):
-                return ReviewDecision(False, level="unknown", source="external_review", reason=f"外部审核失败: {exc}")
-            return ReviewDecision(True, source="external_review_error", reason=f"外部审核失败但按配置放行: {exc}")
+            return unavailable(f"外部审核失败: {exc}")
 
     def _decision_from_external_payload(self, payload: Dict[str, Any]) -> ReviewDecision:
-        label = str(payload.get("level") or payload.get("label") or payload.get("category") or payload.get("status") or "").lower()
+        label = str(
+            payload.get("level") or payload.get("label") or payload.get("category") or payload.get("status") or ""
+        ).lower()
         reason = str(payload.get("reason") or payload.get("message") or "外部审核判定")
         score = self._float_value(payload.get("score", payload.get("nsfw_score")))
         safe = payload.get("safe")
         unsafe_labels = {"unsafe", "nsfw", "adult", "sexual", "porn", "pornography", "nudity", "nude", "explicit"}
         is_r18g = self._truthy(payload.get("r18g", payload.get("is_r18g"))) or label in {"r18g", "gore", "violence"}
-        is_r18 = self._truthy(payload.get("r18", payload.get("is_r18", payload.get("nsfw")))) or label in {"r18", *unsafe_labels}
-        if is_r18g and self._bool_conf("r18_block_r18g", True):
-            return ReviewDecision(False, level="r18g", source="external_review", score=score, reason=reason)
-        if is_r18 and self._bool_conf("r18_block_r18", True):
-            return ReviewDecision(False, level="r18", source="external_review", score=score, reason=reason)
-        if score is not None and score >= self._float_conf("r18_nsfw_score_threshold", 0.65):
-            return ReviewDecision(False, level=label or "r18", source="external_review", score=score, reason=f"{reason}; score={score:.3f} 超过阈值")
+        is_r18 = self._truthy(payload.get("r18", payload.get("is_r18", payload.get("nsfw")))) or label in {
+            "r18",
+            *unsafe_labels,
+        }
+
+        # 一个既没给 safe、也没给 level/score 的响应等于什么都没说，不能当作安全结论。
+        if safe is None and not label and score is None and not is_r18 and not is_r18g:
+            if self._bool_conf("external_review_fail_closed", True):
+                return ReviewDecision(False, LEVEL_UNKNOWN, "external_review", None, "外部审核响应缺少判定字段")
+            return ReviewDecision(True, LEVEL_UNKNOWN, "external_review_skipped", None, "外部审核响应无判定字段")
+
+        if is_r18g:
+            return ReviewDecision(False, LEVEL_R18G, "external_review", score, reason)
+        if is_r18:
+            return ReviewDecision(False, LEVEL_R18, "external_review", score, reason)
+        if score is not None and score >= self._score_threshold():
+            return ReviewDecision(False, LEVEL_R18, "external_review", score, f"{reason}; score 超过阈值")
         if self._falsey(safe):
-            return ReviewDecision(False, level=label or "unsafe", source="external_review", score=score, reason=reason)
-        return ReviewDecision(True, level=label or "safe", source="external_review", score=score, reason=reason)
+            return ReviewDecision(False, label or LEVEL_R18, "external_review", score, reason)
+        return ReviewDecision(True, LEVEL_SAFE, "external_review", score, reason)
 
     def _external_review_protocol(self, api_url: str) -> str:
         configured = str(self._conf("external_review_protocol", "auto") or "auto").strip().lower()
@@ -956,28 +1128,27 @@ class XWDrawPlugin(Star):
         if configured in {"custom", "json"}:
             return "custom"
         normalized = api_url.rstrip("/").lower()
-        if normalized.endswith("/v1") or normalized.endswith("/chat/completions") or "/chat/completions" in normalized:
+        if normalized.endswith("/v1") or "/chat/completions" in normalized:
             return "openai"
         return "custom"
 
     @staticmethod
     def _openai_review_url(api_url: str) -> str:
         url = api_url.rstrip("/")
-        if url.endswith("/chat/completions"):
-            return url
-        return f"{url}/chat/completions"
+        return url if url.endswith("/chat/completions") else f"{url}/chat/completions"
 
     def _openai_review_payload(self, image_data_url: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         model = str(self._conf("external_review_model", "") or "").strip() or "gpt-4o-mini"
         system_prompt = (
             "你是图片安全审核器。只返回一个 JSON 对象，不要 Markdown，不要解释。"
-            "字段必须包含 safe(boolean), level(\"safe\"|\"r18\"|\"r18g\"), score(number), reason(string)。"
+            '字段必须包含 safe(boolean), level("safe"|"r18"|"r18g"), score(number), reason(string)。'
             "score 必须是不安全/NSFW/违规风险分，0 表示完全安全，1 表示高度违规；不要把 score 当作安全置信度。"
             "当 safe=true 且 level=safe 时，score 应小于 0.2。"
             "若图片包含裸露、性行为、色情暗示、成人内容、未成年人性化、血腥猎奇或其他不适合群聊发送的内容，safe=false。"
         )
-        review_metadata = self._external_review_metadata(metadata)
-        user_prompt = "请审核这张图片。服务自审字段：" + json.dumps(review_metadata, ensure_ascii=False)[:800]
+        user_prompt = "请审核这张图片。服务自审字段：" + json.dumps(
+            self._external_review_metadata(metadata), ensure_ascii=False
+        )[:800]
         return {
             "model": model,
             "messages": [
@@ -988,14 +1159,15 @@ class XWDrawPlugin(Star):
                         {"type": "text", "text": user_prompt},
                         {"type": "image_url", "image_url": {"url": image_data_url}},
                     ],
-                }
+                },
             ],
             "temperature": 0,
             "max_tokens": self._int_conf("external_review_max_tokens", 300),
         }
 
     def _external_review_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        flat = self._flatten_review_metadata(metadata)
+        """只把审核字段交给外部模型，绝不把用户提示词带过去（防提示注入）。"""
+        flat = flatten_metadata(metadata)
         allowed_keys = ("is_r18", "is_r18g", "r18", "r18g", "nsfw", "nsfw_score", "score", "date_folder")
         return {key: flat[key] for key in allowed_keys if key in flat}
 
@@ -1003,10 +1175,7 @@ class XWDrawPlugin(Star):
         if isinstance(decoded, dict):
             content = self._openai_message_content(decoded)
             if content:
-                parsed = self._parse_json_object_text(content)
-                if parsed is not None:
-                    return parsed
-                return None
+                return self._parse_json_object_text(content)
             if "choices" in decoded:
                 return None
             return decoded
@@ -1021,13 +1190,9 @@ class XWDrawPlugin(Star):
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                return "\n".join(parts)
+                return "\n".join(
+                    item["text"] for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)
+                )
         except Exception:
             return ""
         return ""
@@ -1069,13 +1234,132 @@ class XWDrawPlugin(Star):
     @staticmethod
     def _float_value(value: Any) -> Optional[float]:
         try:
-            if value is None or value == "":
+            if value is None or value == "" or isinstance(value, bool):
                 return None
             return float(value)
         except Exception:
             return None
 
-    async def _send_image_bytes(self, event: AstrMessageEvent, image_bytes: bytes, caption: str, filename: Optional[str] = None):
+    async def _blocked_text(self, event: AstrMessageEvent, prefix: str, decision: ReviewDecision) -> str:
+        if await self._is_bot_admin(event):
+            return f"{prefix}未通过自审，已停止发送。\n{decision.detail()}"
+        return f"{prefix}未通过安全审核，已停止发送。"
+
+    # --- 提示词解析 ---------------------------------------------------------
+
+    @staticmethod
+    def parse_generate_args(prompt_line: str) -> GenerateArgs:
+        """解析本插件自己消费的参数。-n/-w/-h/-s/-c/-m 等一律留在提示词里交给服务端。"""
+        text = prompt_line.strip()
+
+        is_r18g = bool(re.search(r"(^|\s)--r18g(\s|$)", text, flags=re.I))
+        is_r18 = bool(re.search(r"(^|\s)--r18(\s|$)", text, flags=re.I)) or is_r18g
+        text = re.sub(r"(^|\s)--r18g(\s|$)", " ", text, flags=re.I)
+        text = re.sub(r"(^|\s)--r18(\s|$)", " ", text, flags=re.I)
+
+        ref_mode = "i2i"
+        match = re.search(r"(^|\s)--(vt|pr|i2i)(\s|$)", text, flags=re.I)
+        if match:
+            ref_mode = match.group(2).lower()
+            text = re.sub(r"(^|\s)--(vt|pr|i2i)(\s|$)", " ", text, count=1, flags=re.I)
+
+        denoise = 0.6
+        match = re.search(r"(?:^|\s)-d\s*([0-9]*\.?[0-9]+)", text)
+        if match:
+            try:
+                denoise = max(0.0, min(1.0, float(match.group(1))))
+            except Exception:
+                denoise = 0.6
+            text = re.sub(r"(?:^|\s)-d\s*[0-9]*\.?[0-9]+", " ", text, count=1)
+
+        prompt = re.sub(r"\s+", " ", text).strip()
+        uses_nai = bool(
+            re.search(r"(^|[\s,，])nai[01]?([\s,，]|$)", prompt, flags=re.I)
+            or re.search(r"(?:^|\s)-m\s*9[01](?:\s|$)", prompt)
+        )
+        return GenerateArgs(prompt, denoise, is_r18, is_r18g, ref_mode, uses_nai)
+
+    @staticmethod
+    def _has_sensitive_flag(text_or_tokens: Any) -> bool:
+        text = (
+            text_or_tokens
+            if isinstance(text_or_tokens, str)
+            else " ".join(str(token) for token in text_or_tokens)
+        )
+        return bool(re.search(r"(^|\s)--(?:r18g?|all)(\s|$)", text, flags=re.I))
+
+    def _sensitive_denied_result(self, event: AstrMessageEvent, level: str, matched: List[str]):
+        allowance = self._allowance(event)
+        lines = [
+            f"当前会话不允许生成 {level.upper()} 内容，已在提交前取消，未消耗额度。",
+            f"放行状态：{allowance.describe()}",
+        ]
+        if matched:
+            lines.append("命中词：" + "、".join(matched[:6]))
+        command = "R18开启 含G" if level == LEVEL_R18G else "R18开启"
+        lines.append(f"如需放行，请让 bot 管理员发送「{command}」。")
+        return event.plain_result("\n".join(lines))
+
+    # --- 图片收集与发送 -----------------------------------------------------
+
+    async def _fetch_image_bytes(self, url_or_path: str, timeout: int) -> Optional[bytes]:
+        try:
+            if not url_or_path:
+                return None
+            value = str(url_or_path)
+            if value.startswith("file://"):
+                parsed_path = unquote(urlparse(value).path)
+                if re.match(r"^/[A-Za-z]:/", parsed_path):
+                    parsed_path = parsed_path[1:]
+                value = parsed_path
+            if Path(value).is_file():
+                return Path(value).read_bytes()
+            if value.startswith("http"):
+                timeout_obj = aiohttp.ClientTimeout(total=timeout)
+                async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+                    async with session.get(value) as resp:
+                        resp.raise_for_status()
+                        return await resp.read()
+        except Exception as exc:
+            logger.warning(f"_fetch_image_bytes 失败: {exc}")
+        return None
+
+    async def _image_segment_bytes(self, seg: Any, timeout: int) -> Optional[bytes]:
+        if not isinstance(seg, Image):
+            return None
+        data = getattr(seg, "data", None)
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            decoded = XWDrawApiClient._decode_image_base64(data)
+            if decoded:
+                return decoded
+        image_src = getattr(seg, "url", None) or getattr(seg, "file", None) or getattr(seg, "path", None)
+        return await self._fetch_image_bytes(str(image_src), timeout) if image_src else None
+
+    async def _get_images_from_event(self, event: AstrMessageEvent, timeout: int) -> List[bytes]:
+        """收集消息（含引用回复）里的图片，最多 MAX_REFERENCE_IMAGES 张。"""
+        segments = getattr(getattr(event, "message_obj", None), "message", []) or []
+        ordered: List[Any] = []
+        for seg in segments:
+            if isinstance(seg, Reply) and getattr(seg, "chain", None):
+                ordered.extend(seg.chain)
+        ordered.extend(segments)
+
+        images: List[bytes] = []
+        for seg in ordered:
+            image_bytes = await self._image_segment_bytes(seg, timeout)
+            if image_bytes and image_bytes not in images:
+                images.append(image_bytes)
+            if len(images) >= MAX_REFERENCE_IMAGES:
+                break
+        return images
+
+    async def _get_image_from_event(self, event: AstrMessageEvent, timeout: int) -> Optional[bytes]:
+        images = await self._get_images_from_event(event, timeout)
+        return images[0] if images else None
+
+    async def _send_image_bytes(self, event: AstrMessageEvent, image_bytes: bytes, caption: str, filename: str = ""):
         try:
             if hasattr(Image, "fromBytes"):
                 return event.chain_result([Image.fromBytes(image_bytes), Plain(caption)])
@@ -1092,8 +1376,7 @@ class XWDrawPlugin(Star):
         except Exception as exc:
             logger.debug(f"Image.fromFileSystem 发送失败: {exc}")
         try:
-            message_chain = MessageChain().file_image(str(out_path))
-            await self.context.send_message(event.unified_msg_origin, message_chain)
+            await self.context.send_message(event.unified_msg_origin, MessageChain().file_image(str(out_path)))
             return event.plain_result(caption)
         except Exception as exc:
             logger.error(f"发送图片失败: {exc}")
@@ -1101,40 +1384,7 @@ class XWDrawPlugin(Star):
                 return event.plain_result(f"生成成功，但发送图片失败: {exc}")
             return event.plain_result("生成成功，但发送图片失败，请联系 bot 管理员。")
 
-    async def _send_generated_asset(self, event: AstrMessageEvent, asset: GeneratedAsset):
-        decision = await self._review_generated_asset(asset, event)
-        if not decision.allowed:
-            logger.warning(
-                f"图片生成结果已拦截: source={decision.source}, level={decision.level}, "
-                f"score={decision.score}, reason={decision.reason}, filename={asset.filename}"
-            )
-            if not await self._is_bot_admin(event):
-                return event.plain_result("生成完成，但图片未通过安全审核，已停止发送。")
-            score_text = f"，score={decision.score:.3f}" if decision.score is not None else ""
-            return event.plain_result(f"生成完成，但自审判定为 {decision.level}，已停止发送图片（{decision.reason}{score_text}）。")
-
-        caption = f"生成成功 ({asset.elapsed:.1f}s)"
-        if asset.image_bytes:
-            img_result = await self._send_image_bytes(event, asset.image_bytes, caption, asset.filename)
-            if asset.final_prompt:
-                try:
-                    nodes = [
-                        Node(uin=self._self_id(event), name="小千", content=[Plain(f"实际提示词:\n{asset.final_prompt}")]),
-                    ]
-                    prompt_result = event.chain_result([Nodes(nodes)])
-                    return [img_result, prompt_result]
-                except Exception as exc:
-                    logger.debug(f"转发实际提示词失败: {exc}")
-            return img_result
-        return event.plain_result(f"生成完成 ({asset.elapsed:.1f}s)，但没有拿到可发送的图片数据。")
-
-    async def _review_blocked_text(self, event: AstrMessageEvent, prefix: str, decision: ReviewDecision) -> str:
-        if await self._is_bot_admin(event):
-            score_text = f"，score={decision.score:.3f}" if decision.score is not None else ""
-            return f"{prefix}自审未通过，已停止发送（{decision.reason}{score_text}）。"
-        return f"{prefix}未通过安全审核，已停止发送。"
-
-    async def _send_file_bytes(self, event: AstrMessageEvent, data: bytes, filename: str, content_type: str = ""):
+    async def _send_file_bytes(self, event: AstrMessageEvent, data: bytes, filename: str):
         out_dir = self.plugin_data_dir / "downloads"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / self._safe_filename(filename)
@@ -1149,6 +1399,56 @@ class XWDrawPlugin(Star):
             logger.debug(f"通用文件发送失败: {exc}")
         return event.plain_result(f"文件已保存到插件数据目录：{out_path.name}")
 
+    async def _send_generated_asset(self, event: AstrMessageEvent, asset: GeneratedAsset, prompt_level: str):
+        decision = await self.review_asset(asset, event, prompt_level)
+        if not decision.allowed:
+            return event.plain_result(await self._blocked_text(event, "生成完成，但图片", decision))
+
+        caption = self._generation_caption(asset, decision)
+        if not asset.image_bytes:
+            return event.plain_result(f"生成完成 ({asset.elapsed:.1f}s)，但没有拿到可发送的图片数据。")
+
+        img_result = await self._send_image_bytes(event, asset.image_bytes, caption, asset.filename or "")
+        if not asset.final_prompt:
+            return img_result
+        try:
+            node = Node(uin=self._self_id(event), name="小千", content=[Plain(f"实际提示词：\n{asset.final_prompt}")])
+            return [img_result, event.chain_result([Nodes([node])])]
+        except Exception as exc:
+            logger.debug(f"转发实际提示词失败: {exc}")
+            return img_result
+
+    def _generation_caption(self, asset: GeneratedAsset, decision: ReviewDecision) -> str:
+        lines = [f"✅ 生成完成 · {asset.elapsed:.1f}s"]
+        matched = []
+        for key, label in (("character", "角色"), ("style", "风格"), ("costume", "服装")):
+            values = asset.matches.get(key) if isinstance(asset.matches, dict) else None
+            if values:
+                matched.append(f"{label}:{'/'.join(str(v) for v in values[:3])}")
+        if matched:
+            lines.append("命中预设 " + "  ".join(matched))
+        dropped = asset.matches.get("arch_dropped") if isinstance(asset.matches, dict) else None
+        if dropped:
+            lines.append(f"⚠️ 架构冲突已丢弃：{'/'.join(str(v) for v in dropped[:5])}")
+        if decision.score is not None:
+            lines.append(f"自审 {decision.score:.2f} / 阈值 {self._score_threshold():.2f}")
+        return "\n".join(lines)
+
+    # --- 展示工具 -----------------------------------------------------------
+
+    @staticmethod
+    def mask_endpoint(url: str) -> str:
+        """脱敏服务地址：只保留子域和顶级域，中间打码，避免把绘图站点暴露给群成员。"""
+        host = urlparse(url).netloc or str(url)
+        host = host.split("@")[-1].split(":")[0]
+        parts = [part for part in host.split(".") if part]
+        if len(parts) < 2:
+            return "***"
+        if len(parts) == 2:
+            return f"***.{parts[-1]}"
+        masked = ["*" * len(part) for part in parts[1:-1]]
+        return ".".join([parts[0]] + masked + [parts[-1]])
+
     @staticmethod
     def _safe_filename(filename: str) -> str:
         name = Path(str(filename)).name or f"file_{int(time.time())}"
@@ -1157,36 +1457,58 @@ class XWDrawPlugin(Star):
     @staticmethod
     def _truncate(text: Any, limit: int = 1600) -> str:
         value = str(text)
-        return value if len(value) <= limit else value[:limit] + "..."
+        return value if len(value) <= limit else value[:limit] + "…"
 
     def _format_data(self, data: Any, limit: int = 1800) -> str:
-        if isinstance(data, (dict, list)):
-            text = json.dumps(data, ensure_ascii=False, indent=2)
-        else:
-            text = str(data)
+        text = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list)) else str(data)
         return self._truncate(text, limit)
+
+    @staticmethod
+    def render_card(title: str, sections: List[Tuple[str, List[str]]], footer: str = "") -> str:
+        """统一的卡片式排版。左侧竖线在任意字体下都能对齐，比表格框稳。"""
+        lines = [f"╭─ {title}"]
+        for index, (heading, items) in enumerate(sections):
+            if index:
+                lines.append("│")
+            if heading:
+                lines.append(f"│ {heading}")
+            for item in items:
+                lines.extend(f"│   {part}" for part in str(item).split("\n"))
+        lines.append(f"╰─ {footer}" if footer else "╰────────")
+        return "\n".join(lines)
 
     def _format_items(self, data: Any, title: str, limit: int = 10) -> str:
         items = data
         if isinstance(data, dict):
-            for key in ("images", "items", "results", "videos", "announcements", "prompts"):
+            for key in ("images", "items", "results", "announcements", "prompts"):
                 if isinstance(data.get(key), list):
                     items = data[key]
                     break
         if not isinstance(items, list):
             return f"{title}\n{self._format_data(data)}"
-        lines = [f"{title} (显示 {min(len(items), limit)}/{len(items)} 条)"]
+        rows = []
         for idx, item in enumerate(items[:limit], 1):
             if isinstance(item, dict):
-                name = item.get("filename") or item.get("file") or item.get("title") or item.get("prompt") or item.get("timestamp") or item.get("id") or "未命名"
-                extra = []
-                for key in ("date", "username", "user", "status", "is_r18", "is_r18g", "nsfw_score"):
-                    if key in item:
-                        extra.append(f"{key}={item[key]}")
-                lines.append(f"{idx}. {self._truncate(name, 80)}" + (f" ({', '.join(extra)})" if extra else ""))
+                name = (
+                    item.get("title")
+                    or item.get("filename")
+                    or item.get("prompt")
+                    or item.get("id")
+                    or "未命名"
+                )
+                extra = [f"{key}={item[key]}" for key in ("date", "date_folder", "is_r18", "is_r18g") if key in item]
+                rows.append(f"{idx}. {self._truncate(name, 80)}" + (f"  [{', '.join(extra)}]" if extra else ""))
             else:
-                lines.append(f"{idx}. {self._truncate(item, 120)}")
-        return "\n".join(lines)
+                rows.append(f"{idx}. {self._truncate(item, 140)}")
+        return self.render_card(f"{title} · {min(len(items), limit)}/{len(items)}", [("", rows)])
+
+    def _forward_nodes(self, event: AstrMessageEvent, title: str, lines: List[str], chunk: int = 50):
+        nodes = [Node(uin=self._self_id(event), name="小千", content=[Plain(title)])]
+        for start in range(0, len(lines), chunk):
+            nodes.append(
+                Node(uin=self._self_id(event), name="小千", content=[Plain("\n".join(lines[start : start + chunk]))])
+            )
+        return event.chain_result([Nodes(nodes)])
 
     @staticmethod
     def _parse_limit(tokens: List[str], default: int = 12, max_value: int = 50) -> int:
@@ -1197,9 +1519,7 @@ class XWDrawPlugin(Star):
 
     @staticmethod
     def _parse_bool_token(value: str) -> Optional[bool]:
-        if value is None:
-            return None
-        normalized = str(value).strip().lower()
+        normalized = str(value or "").strip().lower()
         if normalized in {"1", "true", "yes", "y", "on", "是", "开"}:
             return True
         if normalized in {"0", "false", "no", "n", "off", "否", "关"}:
@@ -1207,32 +1527,21 @@ class XWDrawPlugin(Star):
         return None
 
     @staticmethod
-    def _parse_video_args(prompt_line: str) -> Tuple[str, str, str, str]:
-        tokens = prompt_line.split()
-        prompt_parts: List[str] = []
-        negative_parts: List[str] = []
-        duration = "4"
-        fps = "16"
-        i = 0
-        while i < len(tokens):
-            token = tokens[i]
-            if token == "-t" and i + 1 < len(tokens):
-                duration = tokens[i + 1]
-                i += 2
-                continue
-            if token == "-fps" and i + 1 < len(tokens):
-                fps = tokens[i + 1]
-                i += 2
-                continue
-            if token == "-n":
-                i += 1
-                while i < len(tokens) and tokens[i] not in {"-t", "-fps"}:
-                    negative_parts.append(tokens[i])
-                    i += 1
-                continue
-            prompt_parts.append(token)
-            i += 1
-        return " ".join(prompt_parts).strip(), duration, fps, " ".join(negative_parts).strip()
+    def _parse_switch_action(raw: str) -> Optional[bool]:
+        tokens = raw.strip().split()
+        command = tokens[0] if tokens else ""
+        if any(word in command for word in ("开启", "打开", "启用")):
+            return True
+        if any(word in command for word in ("关闭", "禁用", "停止")):
+            return False
+        if len(tokens) < 2:
+            return None
+        value = tokens[1].strip().lower()
+        if value in {"开", "开启", "打开", "启用", "on", "enable", "enabled", "true", "1"}:
+            return True
+        if value in {"关", "关闭", "禁用", "停止", "off", "disable", "disabled", "false", "0"}:
+            return False
+        return None
 
     def _extract_image_ref(self, raw: str) -> Tuple[Optional[str], Optional[str]]:
         parts = raw.strip().split(maxsplit=2)
@@ -1244,6 +1553,20 @@ class XWDrawPlugin(Star):
             return parts[1], parts[2].split(maxsplit=1)[0]
         return None, parts[1]
 
+    async def _get_presets(self, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if not force_refresh and self.presets_cache and (now - self.cache_time < self.cache_duration):
+            return self.presets_cache
+        try:
+            presets = await self._api().presets()
+            if isinstance(presets, dict):
+                self.presets_cache = presets
+                self.cache_time = now
+                return presets
+        except Exception as exc:
+            logger.error(f"获取预设失败: {exc}")
+        return None
+
     async def _handle_api_error(self, event: AstrMessageEvent, exc: Exception):
         if not await self._is_bot_admin(event):
             logger.warning(f"XWDraw 命令执行失败: {exc}")
@@ -1253,80 +1576,13 @@ class XWDrawPlugin(Star):
         if isinstance(exc, XWDrawApiError):
             return event.plain_result(f"请求失败：{exc.message}")
         if isinstance(exc, asyncio.TimeoutError):
-            return event.plain_result(f"请求超时（>{self._int_conf('timeout', 60)}s），请稍后重试或增加 timeout。")
+            return event.plain_result(f"请求超时（>{self._int_conf('timeout', 60)}s），请稍后重试或调大 timeout。")
         logger.exception("XWDraw 命令执行失败")
         return event.plain_result(f"发生未知错误：{exc}")
 
-    @filter.command("绘图开关", aliases={"绘图状态", "绘图开启", "绘图关闭", "xw开关", "xwdraw_switch"}, prefix_optional=True)
-    async def on_plugin_switch(self, event: AstrMessageEvent):
-        action = self._parse_switch_action(event.message_str)
-        if action is None:
-            yield event.plain_result(self._switch_status_text(event) + "\n用法：绘图开启 / 绘图关闭 / 绘图开关 开|关")
-            return
-
-        if not await self._is_switch_admin(event):
-            yield event.plain_result("只有群管理员/群主或配置中的开关管理员可以修改绘图总开关。")
-            return
-
-        try:
-            self._set_session_switch(event, action)
-            state_text = "开启" if action else "关闭"
-            yield event.plain_result(f"已{state_text}当前群/会话的绘图插件总开关。\n{self._switch_status_text(event)}")
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("视频开关", aliases={"视频开启", "视频关闭", "video_switch"}, prefix_optional=True)
-    async def on_video_switch(self, event: AstrMessageEvent):
-        action = self._parse_switch_action(event.message_str)
-        if action is None:
-            enabled = self._bool_conf("video_enabled", False)
-            session_id = self._session_id(event)
-            overrides = self.switch_state.get("video_session_overrides", {})
-            if session_id and session_id in overrides:
-                session_state = "开启" if overrides[session_id] else "关闭"
-                source = "当前会话设置"
-            else:
-                session_state = "开启" if enabled else "关闭"
-                source = "配置默认值"
-            yield event.plain_result(f"视频功能当前状态: {session_state} ({source})\n用法：视频开启 / 视频关闭")
-            return
-        if not await self._is_switch_admin(event):
-            yield event.plain_result("只有群管理员/群主或配置中的开关管理员可以修改视频开关。")
-            return
-        if not self._bool_conf("video_enabled", False):
-            yield event.plain_result("视频功能总开关未在插件配置中开启，无法设置会话级开关。请先将 video_enabled 设为 true。")
-            return
-        try:
-            self._set_video_session_switch(event, action)
-            state_text = "开启" if action else "关闭"
-            yield event.plain_result(f"已{state_text}当前群/会话的视频功能。")
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("测试来点", aliases={"test_xwdraw"}, prefix_optional=True)
-    async def on_test_generate(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        raw = event.message_str.strip()
-        parts = raw.split(maxsplit=1)
-        prompt = parts[1].strip() if len(parts) > 1 else "无提示词"
-        img_bytes = await self._get_image_from_event(event, self._int_conf("timeout", 60))
-        msg_chain = [Plain(f"测试模式\n提示词: {prompt}\n")]
-        if img_bytes:
-            msg_chain.append(Plain("检测到图片输入，已成功获取图片数据。\n"))
-            if self._bool_conf("test_echo_image_enabled", False):
-                decision = await self._review_generated_asset(GeneratedAsset(image_bytes=img_bytes), event)
-                if decision.allowed and hasattr(Image, "fromBytes"):
-                    msg_chain.append(Image.fromBytes(img_bytes))
-                elif not decision.allowed:
-                    msg_chain.append(Plain(await self._review_blocked_text(event, "图片回显", decision)))
-            else:
-                msg_chain.append(Plain("测试图片回显默认关闭，仅确认已检测到图片。"))
-        else:
-            msg_chain.append(Plain("未检测到图片输入 (文生图模式)"))
-        yield event.chain_result(msg_chain)
+    # =======================================================================
+    # 指令：生成
+    # =======================================================================
 
     @filter.command("来点", aliases={"小千来点", "xwdraw"}, prefix_optional=True)
     async def on_generate(self, event: AstrMessageEvent):
@@ -1334,39 +1590,52 @@ class XWDrawPlugin(Star):
         if disabled:
             yield disabled
             return
-        raw = event.message_str.strip()
-        parts = raw.split(maxsplit=1)
+        parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            yield event.plain_result("用法：小千来点 <提示词> [-d 0.6]\n提示：可以附带图片进行图生图。")
+            yield event.plain_result(
+                "用法：来点 <提示词> [-d 0.6] [--vt|--pr]\n附带图片即图生图；详细语法见「绘图帮助 参数」。"
+            )
             return
 
         args = self.parse_generate_args(parts[1])
         if not args.prompt:
             yield event.plain_result("提示词不能为空。")
             return
-        if (args.is_r18 or args.is_r18g or self._has_sensitive_flag(parts[1])) and not self._is_r18_allowed_session(event):
-            yield self._sensitive_content_denied_result(event)
+
+        prompt_level, matched = scan_prompt(args.prompt, self._extra_block_patterns())
+        if args.is_r18g or prompt_level == LEVEL_R18G:
+            requested_level = LEVEL_R18G
+        elif args.is_r18 or prompt_level == LEVEL_R18:
+            requested_level = LEVEL_R18
+        else:
+            requested_level = LEVEL_SAFE
+
+        allowance = self._allowance(event)
+        if self._policy() != "off" and requested_level != LEVEL_SAFE and not allowance.allows(requested_level):
+            yield self._sensitive_denied_result(event, requested_level, matched)
             return
+
         if not self._api().api_key:
             yield event.plain_result("请在插件配置中填写 api_key 后再使用本功能。")
             return
 
         try:
-            img_bytes = await self._get_image_from_event(event, self._int_conf("timeout", 60))
-            mode_text = "图生图" if img_bytes else "文生图"
-            yield event.plain_result(f"收到请求，正在{mode_text}生成 [{self._truncate(args.prompt, 24)}]\n感谢由小维151提供的绘图服务支持")
+            images = await self._get_images_from_event(event, self._int_conf("timeout", DEFAULT_TIMEOUT))
+            yield event.plain_result(self._generation_start_text(args, images, requested_level))
 
-            payload: Dict[str, Any] = {"prompt": args.prompt, "is_r18": args.is_r18, "is_r18g": args.is_r18g}
-            if img_bytes:
-                payload["image"] = "data:image/png;base64," + base64.b64encode(img_bytes).decode("utf-8")
+            payload: Dict[str, Any] = {
+                "prompt": args.prompt,
+                "is_r18": args.is_r18 or requested_level in (LEVEL_R18, LEVEL_R18G),
+                "is_r18g": args.is_r18g or requested_level == LEVEL_R18G,
+            }
+            if images:
+                payload["image"] = base64.b64encode(images[0]).decode("utf-8")
+                payload["images"] = [base64.b64encode(item).decode("utf-8") for item in images]
+                payload["nai_ref_mode"] = args.nai_ref_mode
                 payload["denoising_strength"] = args.denoising_strength
 
             asset = await self._api().generate(payload)
-            if args.is_r18:
-                asset.metadata["is_r18"] = True
-            if args.is_r18g:
-                asset.metadata["is_r18g"] = True
-            result = await self._send_generated_asset(event, asset)
+            result = await self._send_generated_asset(event, asset, prompt_level)
             if isinstance(result, list):
                 for item in result:
                     yield item
@@ -1375,100 +1644,460 @@ class XWDrawPlugin(Star):
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
+    def _generation_start_text(self, args: GenerateArgs, images: List[bytes], requested_level: str) -> str:
+        if not images:
+            mode = "文生图"
+        elif args.nai_ref_mode == "vt":
+            mode = f"风格参考 VT ×{len(images)}"
+        elif args.nai_ref_mode == "pr":
+            mode = f"角色参考 PR ×{len(images)}"
+        else:
+            mode = f"图生图 (去噪 {args.denoising_strength:g})"
+        lines = [f"🎨 已提交 · {mode}", f"提示词：{self._truncate(args.prompt, 60)}"]
+        if args.uses_nai:
+            lines.append("模型：NovelAI（走独立 NAI 额度）")
+        if requested_level != LEVEL_SAFE:
+            lines.append(f"分级：{requested_level.upper()}（当前会话已放行）")
+        lines.append("绘图服务由 小维151 提供支持")
+        return "\n".join(lines)
+
+    @filter.command("测试来点", aliases={"test_xwdraw"}, prefix_optional=True)
+    async def on_test_generate(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        parts = event.message_str.strip().split(maxsplit=1)
+        prompt = parts[1].strip() if len(parts) > 1 else "无提示词"
+        args = self.parse_generate_args(prompt)
+        level, matched = scan_prompt(args.prompt, self._extra_block_patterns())
+        images = await self._get_images_from_event(event, self._int_conf("timeout", DEFAULT_TIMEOUT))
+
+        lines = [
+            "🧪 测试模式（不会真的生成）",
+            f"解析提示词：{self._truncate(args.prompt, 120)}",
+            f"去噪强度：{args.denoising_strength:g}　参考图用途：{args.nai_ref_mode}",
+            f"提示词预筛：{level}" + ("　命中：" + "、".join(matched[:6]) if matched else ""),
+            f"分级放行：{self._allowance(event).describe()}",
+            f"检测到图片：{len(images)} 张",
+        ]
+        chain: List[Any] = [Plain("\n".join(lines))]
+        if images and self._bool_conf("test_echo_image_enabled", False):
+            decision = await self.review_local_image(images[0], event)
+            if decision.allowed and hasattr(Image, "fromBytes"):
+                chain.append(Image.fromBytes(images[0]))
+            elif not decision.allowed:
+                chain.append(Plain("\n" + await self._blocked_text(event, "图片回显", decision)))
+        elif images:
+            chain.append(Plain("\n图片回显默认关闭，仅确认已检测到图片。"))
+        yield event.chain_result(chain)
+
+    # =======================================================================
+    # 指令：帮助
+    # =======================================================================
+
     @filter.command("绘图帮助", aliases={"xw帮助", "xwhelp"}, prefix_optional=True)
     async def on_help(self, event: AstrMessageEvent):
-        if await self._is_bot_admin(event):
-            yield event.plain_result(self._bot_admin_help_text())
+        parts = event.message_str.strip().split(maxsplit=1)
+        topic = parts[1].strip().lower() if len(parts) > 1 else ""
+        if topic in {"参数", "param", "params", "语法"}:
+            yield event.plain_result(self._help_params())
             return
-        if await self._is_switch_admin(event):
-            yield event.plain_result(self._switch_admin_help_text())
+        if topic in {"nai", "novelai"}:
+            yield event.plain_result(self._help_nai())
             return
-        yield event.plain_result(self._public_help_text())
+        if topic in {"预设", "preset", "presets"}:
+            yield event.plain_result(self._help_presets())
+            return
+        if topic in {"审核", "r18", "review"}:
+            yield event.plain_result(self._help_review(event))
+            return
+        if topic in {"管理", "admin", "管理员"}:
+            if not await self._is_bot_admin(event):
+                yield event.plain_result("管理员菜单仅 bot 管理员可见。")
+                return
+            yield event.plain_result(self._help_admin())
+            return
+        yield event.plain_result(self._help_overview(await self._is_bot_admin(event), await self._is_switch_admin(event)))
 
-    def _public_help_text(self) -> str:
-        return """XW绘图帮助
+    def _help_overview(self, is_bot_admin: bool, is_switch_admin: bool) -> str:
+        sections: List[Tuple[str, List[str]]] = [
+            (
+                "✦ 生成",
+                [
+                    "来点 <提示词>　　　文生图",
+                    "附图 + 来点 <提示词>　图生图",
+                    "测试来点 <提示词>　　只解析不生成",
+                ],
+            ),
+            (
+                "✦ 预设",
+                [
+                    "预设列表 / 角色列表 / 风格列表 / 服装列表",
+                    "预设搜索 <关键词>",
+                    "预设详情 <角色|风格|服装> <名称>",
+                    "预设图片 <类型> <名称> · 服装预览 <名称>",
+                ],
+            ),
+            (
+                "✦ 信息",
+                [
+                    "绘图状态　当前开关与放行状态",
+                    "绘图公告 · 推荐提示 · 绘图队列 · 绘图模型",
+                ],
+            ),
+            (
+                "✦ 更多",
+                [
+                    "绘图帮助 参数　　参数与多角色语法",
+                    "绘图帮助 nai　　 NovelAI 与参考图",
+                    "绘图帮助 预设　　预设怎么用",
+                    "绘图帮助 审核　　R18 分级说明",
+                ],
+            ),
+        ]
+        if is_switch_admin:
+            sections.append(("✦ 群管理", ["绘图开启 / 绘图关闭 / 绘图开关 开|关"]))
+        if is_bot_admin:
+            sections.append(("✦ Bot 管理员", ["绘图帮助 管理　查看全部维护指令"]))
+        return self.render_card(f"🎨 小维绘图 · 帮助 v{PLUGIN_VERSION}", sections, "服务由 小维151 提供")
 
-【生成】
-来点 <提示词>
-小千来点 <提示词>
-附带图片 + 来点 <提示词> - 图生图
+    def _help_params(self) -> str:
+        return self.render_card(
+            "⚙️ 绘图参数速查",
+            [
+                (
+                    "✦ 插件解析",
+                    [
+                        "-d <0~1>　图生图去噪强度，默认 0.6，越低越像原图",
+                        "--vt / --pr　参考图用途改为风格参考 / 角色参考（NAI）",
+                        "--r18 / --r18g　标记分级，仅在放行会话可用",
+                    ],
+                ),
+                (
+                    "✦ 服务端解析（原样写在提示词里）",
+                    [
+                        "-n <词条>　负面提示，其后全部算负面直到下一个参数",
+                        "-w <宽> -h <高>　分辨率，各自 < 2048",
+                        "-s <步数>　默认 30　·　-c <CFG>　控制系数",
+                        "-m <模型 id>　默认 0，见「绘图模型」",
+                        "也可以直接写 1920x1080 指定尺寸",
+                    ],
+                ),
+                (
+                    "✦ 预设与随机",
+                    [
+                        "弗洛洛,1920x1080,风格009,场景002",
+                        "自定义0.9今汐,女仆装　（自定义=去掉默认服装，0.9=lora 权重）",
+                        "小维,随机服装 / 随机风格 / 随机场景 / 随机预设",
+                    ],
+                ),
+                (
+                    "✦ 多角色",
+                    [
+                        "按实际人数写 2girl / 3boy（不加 s）",
+                        "预设角色自带 BREAK 且自动排在最后",
+                        "角色名{英文词条} 给单个角色单独描述",
+                        "结尾加 上下 / 左右 切换分区方向（默认左右）",
+                        "用 danbooru 标签时角色放最后并加 BREAK（大写）",
+                    ],
+                ),
+            ],
+            "正面提示词支持中文自动翻译",
+        )
 
-【预设】
-预设列表
-角色列表 / 风格列表 / 服装列表
-预设详情 <类型> <名称>
-预设图片 <类型> <图片名>
-服装预览 <名称>
+    def _help_nai(self) -> str:
+        return self.render_card(
+            "☁️ NovelAI V4.5",
+            [
+                (
+                    "✦ 启用",
+                    [
+                        "提示词里写 nai 或 -m 90　→ V4.5 Curated",
+                        "提示词里写 nai1 或 -m 91　→ V4.5 Full",
+                        "走独立 NAI 额度，与本地额度不通用",
+                    ],
+                ),
+                (
+                    "✦ 额度消耗",
+                    [
+                        "纯文生图 = 1　·　整图重绘 = 1",
+                        "风格参考 VT = 10 × 张数",
+                        "角色参考 PR = 25 × 张数（含自动立绘）",
+                    ],
+                ),
+                (
+                    "✦ 参考图",
+                    [
+                        "附图 + --vt　只学画风色调，不复制构图角色",
+                        "附图 + --pr　保持角色长相服装一致",
+                        "最多 4 张；也可在提示词里写 VT0.8{1}, PR{2,角色}",
+                        "底图取第一张没被 VT/PR 占用的图",
+                    ],
+                ),
+                (
+                    "✦ 语法差异",
+                    [
+                        "权重用 1.3::blue eyes:: 或 {tag}，(tag:1.3) 会自动换算",
+                        "角色定位 名字{@C3, 词条}，5x5 格 A1 左上 / E5 右下",
+                        "风格 039-050 为 NAI 画师串，使用后自动切 nai 架构",
+                        "不支持局部重绘与 BREAK 分区",
+                    ],
+                ),
+            ],
+            "无需本地 Lora，知名角色直接写 danbooru 标签",
+        )
 
-【视频】
-附带图片 + 视频生成 <提示词> [-t 秒] [-fps 帧率] [-n 负面提示词]
+    def _help_presets(self) -> str:
+        return self.render_card(
+            "🎭 预设用法",
+            [
+                (
+                    "✦ 查看",
+                    [
+                        "预设列表　　各类预设数量总览",
+                        "角色列表 / 风格列表 / 服装列表",
+                        "预设搜索 <关键词>　名字太多时优先用它",
+                        "预设详情 <角色|风格|服装> <名称>",
+                        "预设图片 <类型> <名称> · 服装预览 <名称>",
+                    ],
+                ),
+                (
+                    "✦ 用在提示词里",
+                    [
+                        "直接写预设名即可：长离,风格026,服装010",
+                        "自定义<角色> 去掉该角色的默认服装",
+                        "自定义0.9<角色> 指定 lora 权重（建议 0.8~1.2）",
+                    ],
+                ),
+                (
+                    "✦ 架构限制",
+                    [
+                        "预设分属 illi / anima / nai 三种架构，不能混用",
+                        "一次生成只用一个架构，冲突的预设会被自动丢弃",
+                        "用 -m 明确指定模型时以该模型架构为准",
+                        "生成结果里会提示哪些预设被丢弃",
+                    ],
+                ),
+            ],
+            "角色翻译表是通用 danbooru 标签，不绑架构",
+        )
 
-【信息】
-绘图公告
-推荐提示
-绘图状态
-"""
+    def _help_review(self, event: AstrMessageEvent) -> str:
+        policy = self._policy()
+        threshold = self._score_threshold()
+        return self.render_card(
+            "🛡️ R18 分级审核",
+            [
+                (
+                    "✦ 当前状态",
+                    [
+                        f"版本形态：{self._edition_label()}",
+                        f"审核策略：{policy}　拦截阈值：{threshold:.2f}",
+                        f"本会话放行：{self._allowance(event).describe()}",
+                    ],
+                ),
+                (
+                    "✦ 判定依据",
+                    [
+                        "提示词预筛　命中 R18/R18G 词条时在提交前就拦下",
+                        "服务端标记　is_r18/is_r18g 只用于拦截，不用于放行",
+                        "分类器分数　nsfw_score 是唯一的放行依据",
+                        "外部视觉审核　可选，作为额外一道关",
+                    ],
+                ),
+                (
+                    "✦ 阈值档位",
+                    [
+                        "strict 0.80　连泳装擦边也拦",
+                        "standard 0.90　只拦明确 R18（默认）",
+                        "loose 0.97　几乎只拦最露骨的",
+                    ],
+                ),
+            ],
+            "拿不到分数时默认保守不发送",
+        )
 
-    def _switch_admin_help_text(self) -> str:
-        return self._public_help_text() + """
-【群管理】
-绘图开启
-绘图关闭
-绘图开关 开|关
-"""
+    def _help_admin(self) -> str:
+        return self.render_card(
+            "🔧 Bot 管理员指令",
+            [
+                ("✦ 账号", ["绘图账号　额度与用量", "绘图版本　服务端版本", "生成配置　模型与参数范围"]),
+                (
+                    "✦ 图库",
+                    [
+                        "最近图片 [数量] [--r18|--all]",
+                        "图片元数据 <日期>/<文件名>",
+                        "更新图片标签 <日期>/<文件名> r18=true r18g=false",
+                        "画廊列表 [页码] [关键词] · 画廊筛选",
+                        "画廊删除 <日期>/<文件名>",
+                    ],
+                ),
+                ("✦ 自定义预设", ["我的预设", "添加预设 <名称>|<内容>", "删除预设 <名称>"]),
+                ("✦ 审核", ["R18状态 / R18开启 / R18关闭 [含G]", "绘图审核 [数量]　最近审核记录"]),
+                ("✦ 文档", ["绘图文档　列出可下载文档", "绘图文档 <名称>"]),
+            ],
+            "R18 放行是会话级持久化设置",
+        )
 
-    def _bot_admin_help_text(self) -> str:
-        return self._switch_admin_help_text() + """
-【Bot 管理员】
-绘图账号 / 绘图配额
-生成配置
-绘图队列
-最近图片 [数量]
-图片元数据 <日期>/<文件名>
-更新图片标签 <日期>/<文件名> r18=true r18g=false
-画廊列表 [页码] [关键词]
-画廊筛选
-视频历史
-视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>
-添加预设 <名称>|<内容>
-删除预设 <名称>
-我的预设
-绘图文档 <名称>
+    # =======================================================================
+    # 指令：开关与状态
+    # =======================================================================
 
-敏感内容相关查询和生成只允许在配置白名单会话内使用。
-"""
+    @filter.command("绘图开关", aliases={"绘图开启", "绘图关闭", "xw开关", "xwdraw_switch"}, prefix_optional=True)
+    async def on_plugin_switch(self, event: AstrMessageEvent):
+        action = self._parse_switch_action(event.message_str)
+        if action is None:
+            yield event.plain_result(self._switch_status_text(event) + "\n用法：绘图开启 / 绘图关闭 / 绘图开关 开|关")
+            return
+        if not await self._is_switch_admin(event):
+            yield event.plain_result("只有群管理员/群主或配置中的开关管理员可以修改绘图总开关。")
+            return
+        try:
+            self._set_session_switch(event, action)
+            yield event.plain_result(f"已{'开启' if action else '关闭'}当前会话的绘图总开关。\n{self._switch_status_text(event)}")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
 
-    @filter.command("绘图账号", aliases={"绘图配额", "xw账号"}, prefix_optional=True)
-    async def on_account(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
+    def _switch_status_text(self, event: AstrMessageEvent) -> str:
+        session_id = self._session_id(event) or "unknown"
+        overrides = self._session_switch_overrides()
+        if session_id in overrides:
+            source, enabled = "当前会话设置", bool(overrides[session_id])
+        else:
+            source, enabled = "配置默认值", self._bool_conf("plugin_enabled", True)
+        return (
+            f"绘图总开关：{'开启' if enabled else '关闭'}\n"
+            f"作用范围：当前会话 ({session_id})\n"
+            f"状态来源：{source}"
+        )
+
+    @filter.command("绘图状态", aliases={"xw状态", "xwdraw_status"}, prefix_optional=True)
+    async def on_status(self, event: AstrMessageEvent):
+        enabled = self._is_plugin_enabled_for_event(event)
+        is_bot_admin = await self._is_bot_admin(event)
+        queue_text = "查询失败"
+        try:
+            queue = await self._api().queue_status()
+            queue_text = str(queue.get("queue_count")) if isinstance(queue, dict) else str(queue)
+        except Exception as exc:
+            logger.debug(f"查询队列失败: {exc}")
+        endpoint = self._api().base_url if is_bot_admin else self.mask_endpoint(self._api().base_url)
+
+        sections: List[Tuple[str, List[str]]] = [
+            (
+                "✦ 开关",
+                [
+                    f"绘图总开关：{'开启 ✅' if enabled else '关闭 ❌'}",
+                    f"版本形态：{self._edition_label()}",
+                    f"分级放行：{self._allowance(event).describe()}",
+                ],
+            ),
+            (
+                "✦ 审核",
+                [f"策略：{self._policy()}　阈值：{self._score_threshold():.2f}", f"外部审核：{'开启' if self._bool_conf('external_review_enabled', False) else '关闭'}"],
+            ),
+            ("✦ 服务", [f"当前排队：{queue_text}", f"接口：{endpoint}"]),
+        ]
+        if is_bot_admin:
+            try:
+                account = await self._api().verify()
+                if isinstance(account, dict):
+                    sections.append(
+                        (
+                            "✦ 额度",
+                            [
+                                f"本地：{account.get('usage')} / {account.get('quota')}（剩余 {account.get('remaining')}）",
+                                f"NAI：{account.get('nai_usage')} / {account.get('nai_quota')}（剩余 {account.get('nai_remaining')}）",
+                            ],
+                        )
+                    )
+            except Exception as exc:
+                logger.debug(f"查询账号失败: {exc}")
+        yield event.plain_result(self.render_card("📊 小维绘图 · 状态", sections, "绘图帮助 查看指令"))
+
+    @filter.command(
+        "R18开关",
+        aliases={"R18开启", "R18关闭", "R18状态", "r18开关", "r18开启", "r18关闭", "r18状态", "r18_switch"},
+        prefix_optional=True,
+    )
+    async def on_r18_switch(self, event: AstrMessageEvent):
+        raw = event.message_str.strip()
+        action = self._parse_switch_action(raw)
+        allowance = self._allowance(event)
+        if action is None:
+            yield event.plain_result(
+                self.render_card(
+                    "🛡️ R18 放行状态",
+                    [
+                        (
+                            "",
+                            [
+                                f"当前会话：{allowance.describe()}",
+                                f"版本形态：{self._edition_label()}",
+                                f"审核策略：{self._policy()}　阈值：{self._score_threshold():.2f}",
+                            ],
+                        ),
+                        ("✦ 用法", ["R18开启　放行 R18", "R18开启 含G　同时放行 R18G", "R18关闭　恢复拦截", "R18跟随　清除本会话设置"]),
+                    ],
+                )
+            )
             return
         denied = await self._admin_only_result(event)
         if denied:
             yield denied
             return
+        include_gore = bool(re.search(r"含G|r18g|加G|gore", raw, flags=re.I))
         try:
-            data = await self._api().verify()
-            yield event.plain_result("绘图账号信息\n" + self._format_data(data))
+            self._set_r18_override(event, action, action and include_gore)
+            self.review_cache = DecisionCache()
+            yield event.plain_result(
+                f"已更新本会话 R18 放行设置。\n{self._allowance(event).describe()}"
+                + ("\n⚠️ R18G 已放行，请确认这是你要的。" if action and include_gore else "")
+            )
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
-    @filter.command("生成配置", aliases={"绘图配置", "generation_config"}, prefix_optional=True)
-    async def on_generation_config(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
+    @filter.command("R18跟随", aliases={"R18默认", "r18跟随", "r18默认", "r18_reset"}, prefix_optional=True)
+    async def on_r18_reset(self, event: AstrMessageEvent):
         denied = await self._admin_only_result(event)
         if denied:
             yield denied
             return
-        try:
-            data = await self._api().generation_config()
-            yield event.plain_result("生成配置\n" + self._format_data(data))
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
+        self._clear_r18_override(event)
+        self.review_cache = DecisionCache()
+        yield event.plain_result(f"已清除本会话 R18 设置，改为跟随插件配置。\n{self._allowance(event).describe()}")
+
+    @filter.command("绘图审核", aliases={"审核日志", "review_log"}, prefix_optional=True)
+    async def on_review_log(self, event: AstrMessageEvent):
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        limit = self._parse_limit(event.message_str.strip().split()[1:], default=10, max_value=30)
+        stats = self.review_log.stats()
+        rows = []
+        for entry in self.review_log.recent(limit):
+            score = f"{entry['score']:.3f}" if entry["score"] is not None else "—"
+            head = (
+                f"{'✅' if entry['allowed'] else '❌'} {entry['time']}　{entry['level']}"
+                f"　score={score}　来源={entry['source']}"
+            )
+            detail = f"  会话 {entry['session']}　用户 {entry['sender']}"
+            if entry["filename"]:
+                detail += f"　文件 {entry['filename']}"
+            rows.append(head + "\n" + detail)
+        yield event.plain_result(
+            self.render_card(
+                "🛡️ 最近审核记录",
+                [("", rows or ["暂无记录"])],
+                f"累计 {stats['total']} 次，拦截 {stats['blocked']} 次",
+            )
+        )
+
+    # =======================================================================
+    # 指令：公开信息
+    # =======================================================================
 
     @filter.command("绘图公告", aliases={"xw公告"}, prefix_optional=True)
     async def on_announcements(self, event: AstrMessageEvent):
@@ -1478,24 +2107,13 @@ class XWDrawPlugin(Star):
             return
         try:
             data = await self._api().announcements()
-            yield event.plain_result(self._format_items(data, "绘图公告", limit=8))
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("绘图队列", aliases={"队列状态", "xw队列"}, prefix_optional=True)
-    async def on_queue_status(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        try:
-            data = await self._api().queue_status()
-            count = data.get("queue_count") if isinstance(data, dict) else data
-            yield event.plain_result(f"当前绘图排队数：{count}")
+            items = data.get("announcements", []) if isinstance(data, dict) else []
+            rows = []
+            for item in items[:6]:
+                mark = "🔴" if item.get("importance") == "important" else "•"
+                rows.append(f"{mark} [{item.get('date', '')}] {item.get('title', '')}")
+                rows.append(f"   {self._truncate(item.get('content', ''), 160)}")
+            yield event.plain_result(self.render_card("📢 绘图公告", [("", rows or ["暂无公告"])]))
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
@@ -1507,9 +2125,66 @@ class XWDrawPlugin(Star):
             return
         try:
             data = await self._api().recommended_prompts()
-            yield event.plain_result(self._format_items(data, "推荐提示", limit=12))
+            prompts = data.get("prompts", []) if isinstance(data, dict) else []
+            rows = [f"{idx}. {self._truncate(item, 140)}" for idx, item in enumerate(prompts[:12], 1)]
+            yield event.plain_result(self.render_card("💡 推荐提示", [("", rows or ["暂无内容"])]))
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
+
+    @filter.command("绘图队列", aliases={"队列状态", "xw队列"}, prefix_optional=True)
+    async def on_queue_status(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        try:
+            data = await self._api().queue_status()
+            count = data.get("queue_count") if isinstance(data, dict) else data
+            yield event.plain_result(f"⏳ 当前绘图排队数：{count}")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("绘图模型", aliases={"模型列表", "xw模型"}, prefix_optional=True)
+    async def on_models(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        try:
+            config = await self._api().generation_config()
+            if not isinstance(config, dict):
+                yield event.plain_result("获取模型列表失败。")
+                return
+            architectures = config.get("architectures", {}) or {}
+            grouped: Dict[str, List[str]] = {}
+            for model in config.get("models", []) or []:
+                arch = str(model.get("architecture", "其他"))
+                desc = (model.get("meta") or {}).get("desc", "")
+                line = f"-m {model.get('id')}　{model.get('display_name')}"
+                if desc:
+                    line += f"　· {desc}"
+                grouped.setdefault(arch, []).append(line)
+            sections = []
+            for arch, lines in grouped.items():
+                label = (architectures.get(arch) or {}).get("display_name", arch)
+                sections.append((f"✦ {label}（{arch}）", lines))
+            sections.append(
+                (
+                    "✦ 范围",
+                    [
+                        f"步数 {config.get('steps_range')}　CFG {config.get('cfg_range')}",
+                        f"宽 {config.get('width_range')}　高 {config.get('height_range')}",
+                        f"默认架构 {config.get('default_architecture')}　默认步数 {config.get('default_steps')}",
+                    ],
+                )
+            )
+            yield event.plain_result(self.render_card("🧩 可用模型", sections, "在提示词里用 -m <id> 指定"))
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    # =======================================================================
+    # 指令：预设
+    # =======================================================================
 
     @filter.command("预设列表", aliases={"presets", "预设"}, prefix_optional=True)
     async def on_list_presets(self, event: AstrMessageEvent):
@@ -1521,17 +2196,23 @@ class XWDrawPlugin(Star):
         if not presets:
             yield event.plain_result("获取预设列表失败，请稍后重试。")
             return
-        msg = "预设分类列表\n\n"
-        if "character_lora" in presets:
-            msg += f"角色预设: {len(presets['character_lora'])} 个\n"
-        if "style" in presets:
-            msg += f"风格预设: {len(presets['style'])} 个\n"
-        if "costume" in presets:
-            msg += f"服装预设: {len(presets['costume'])} 个\n"
-        if "user_presets" in presets:
-            msg += f"用户预设: {len(presets['user_presets'])} 个\n"
-        msg += "\n使用 角色列表 / 风格列表 / 服装列表 查看详情。"
-        yield event.plain_result(msg)
+        rows = []
+        for key, label in (
+            ("character_lora", "角色预设"),
+            ("character_translation", "角色翻译表"),
+            ("style", "风格预设"),
+            ("costume", "服装预设"),
+            ("user_presets", "用户预设"),
+        ):
+            if key in presets:
+                rows.append(f"{label}：{len(presets[key])} 个")
+        yield event.plain_result(
+            self.render_card(
+                "🎭 预设总览",
+                [("", rows)],
+                "角色列表 / 风格列表 / 服装列表 / 预设搜索 <关键词>",
+            )
+        )
 
     async def _send_preset_list(self, event: AstrMessageEvent, key: str, title: str):
         disabled = self._disabled_result(event)
@@ -1542,16 +2223,32 @@ class XWDrawPlugin(Star):
         if not presets or key not in presets:
             yield event.plain_result(f"获取{title}失败。")
             return
-        names = list(presets[key].keys()) if isinstance(presets[key], dict) else list(presets[key])
-        nodes = [Node(uin=self._self_id(event), name="小千", content=[Plain(f"{title} (共 {len(names)} 个)")])]
-        for start in range(0, len(names), 50):
-            lines = []
-            for idx, name in enumerate(names[start:start + 50], start=start + 1):
-                value = presets[key][name] if isinstance(presets[key], dict) else name
-                alias = ", ".join(value[:2]) if isinstance(value, list) else name
-                lines.append(f"{idx}. {alias}")
-            nodes.append(Node(uin=self._self_id(event), name="小千", content=[Plain("\n".join(lines))]))
-        yield event.chain_result([Nodes(nodes)])
+        entries = self._preset_entries(presets[key])
+        lines = [
+            f"{idx}. {name}" + (f"　别名 {'/'.join(aliases[1:4])}" if len(aliases) > 1 else "")
+            for idx, (name, aliases, _content) in enumerate(entries, 1)
+        ]
+        yield self._forward_nodes(event, f"{title}（共 {len(entries)} 个）", lines)
+
+    @staticmethod
+    def _preset_entries(collection: Any) -> List[Tuple[str, List[str], str]]:
+        """服务端三种预设结构统一成 (显示名, 全部别名, 内容)。
+
+        character_lora / style / character_translation 是 {内容: [别名…]}，
+        costume 是 {名称: 内容}，user_presets 是 {名称: {content: …}}。
+        """
+        entries: List[Tuple[str, List[str], str]] = []
+        if not isinstance(collection, dict):
+            return [(str(item), [str(item)], "") for item in collection or []]
+        for key, value in collection.items():
+            if isinstance(value, list) and value:
+                aliases = [str(alias) for alias in value]
+                entries.append((aliases[0], aliases, str(key)))
+            elif isinstance(value, dict):
+                entries.append((str(key), [str(key)], str(value.get("content", ""))))
+            else:
+                entries.append((str(key), [str(key)], str(value)))
+        return entries
 
     @filter.command("角色列表", aliases={"角色预设", "characters"}, prefix_optional=True)
     async def on_list_characters(self, event: AstrMessageEvent):
@@ -1568,18 +2265,72 @@ class XWDrawPlugin(Star):
         async for result in self._send_preset_list(event, "costume", "服装预设列表"):
             yield result
 
+    @filter.command("预设搜索", aliases={"搜索预设", "preset_search"}, prefix_optional=True)
+    async def on_search_presets(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        parts = event.message_str.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            yield event.plain_result("用法：预设搜索 <关键词>")
+            return
+        keyword = parts[1].strip()
+        presets = await self._get_presets()
+        if not presets:
+            yield event.plain_result("获取预设失败，请稍后重试。")
+            return
+
+        arch_map = presets.get("preset_arch", {}) if isinstance(presets.get("preset_arch"), dict) else {}
+        needle = keyword.lower()
+        sections: List[Tuple[str, List[str]]] = []
+        for key, label, show_content in (
+            ("character_lora", "角色", False),
+            ("character_translation", "角色翻译", True),
+            ("style", "风格", False),
+            ("costume", "服装", True),
+            ("user_presets", "用户预设", True),
+        ):
+            hits = []
+            for name, aliases, content in self._preset_entries(presets.get(key, {})):
+                if not any(needle in alias.lower() for alias in aliases):
+                    continue
+                line = name
+                if len(aliases) > 1:
+                    line += f"　别名 {'/'.join(aliases[1:4])}"
+                arch = next((arch_map[alias] for alias in aliases if isinstance(arch_map.get(alias), list)), None)
+                if arch:
+                    line += f"　[{'/'.join(arch)}]"
+                if show_content and content:
+                    line += f"\n  {self._truncate(content, 70)}"
+                hits.append(line)
+                if len(hits) >= 15:
+                    break
+            if hits:
+                sections.append((f"✦ {label}（{len(hits)}）", hits))
+        if not sections:
+            yield event.plain_result(f"没有找到包含「{keyword}」的预设。")
+            return
+        yield event.plain_result(self.render_card(f"🔍 预设搜索「{keyword}」", sections, "每类最多显示 15 条"))
+
     @filter.command("预设详情", aliases={"preset", "预设信息"}, prefix_optional=True)
     async def on_preset_detail(self, event: AstrMessageEvent):
         disabled = self._disabled_result(event)
         if disabled:
             yield disabled
             return
-        raw = event.message_str.strip()
-        parts = raw.split(maxsplit=2)
+        parts = event.message_str.strip().split(maxsplit=2)
         if len(parts) < 3:
             yield event.plain_result("用法：预设详情 <类型> <名称>\n类型：character/style/costume 或 角色/风格/服装")
             return
-        type_map = {"character": "character_lora", "角色": "character_lora", "style": "style", "风格": "style", "costume": "costume", "服装": "costume"}
+        type_map = {
+            "character": "character_lora",
+            "角色": "character_lora",
+            "style": "style",
+            "风格": "style",
+            "costume": "costume",
+            "服装": "costume",
+        }
         api_type = type_map.get(parts[1].lower(), parts[1])
         try:
             detail = await self._api().preset_detail(api_type, parts[2])
@@ -1599,81 +2350,13 @@ class XWDrawPlugin(Star):
             return
         try:
             data, _ctype = await self._api().preset_image(parts[1], parts[2])
-            decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
+            decision = await self.review_local_image(data, event)
             if not decision.allowed:
-                yield event.plain_result(await self._review_blocked_text(event, "预设图片", decision))
+                yield event.plain_result(await self._blocked_text(event, "预设图片", decision))
                 return
-            yield await self._send_image_bytes(event, data, "预设图片", parts[2])
+            yield await self._send_image_bytes(event, data, f"预设图片 · {parts[2]}", parts[2])
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
-
-    @filter.command("添加预设", aliases={"新建预设", "addpreset"}, prefix_optional=True)
-    async def on_add_preset(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        parts = event.message_str.strip().split(maxsplit=1)
-        if len(parts) < 2 or "|" not in parts[1]:
-            yield event.plain_result("用法：添加预设 <名称>|<内容>")
-            return
-        preset_name, preset_content = [part.strip() for part in parts[1].split("|", 1)]
-        if not preset_name or not preset_content:
-            yield event.plain_result("名称和内容不能为空。")
-            return
-        try:
-            result = await self._api().add_user_preset(preset_name, preset_content)
-            await self._get_presets(force_refresh=True)
-            msg = result.get("message", "预设添加成功") if isinstance(result, dict) else "预设添加成功"
-            yield event.plain_result(msg)
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("删除预设", aliases={"移除预设", "delpreset"}, prefix_optional=True)
-    async def on_delete_preset(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        parts = event.message_str.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            yield event.plain_result("用法：删除预设 <名称>")
-            return
-        try:
-            await self._api().delete_user_preset(parts[1].strip())
-            await self._get_presets(force_refresh=True)
-            yield event.plain_result(f"预设 '{parts[1].strip()}' 已删除")
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("我的预设", aliases={"自定义预设", "mypresets"}, prefix_optional=True)
-    async def on_my_presets(self, event: AstrMessageEvent):
-        disabled = self._disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        try:
-            data = await self._api().user_presets()
-            yield event.plain_result(self._format_items(data, "我的预设", limit=20))
-        except Exception:
-            presets = await self._get_presets()
-            user_presets = presets.get("user_presets") if isinstance(presets, dict) else None
-            if not user_presets:
-                yield event.plain_result("暂无自定义预设或获取失败。")
-                return
-            yield event.plain_result(self._format_data(user_presets))
 
     @filter.command("服装预览", aliases={"costume_image"}, prefix_optional=True)
     async def on_costume_image(self, event: AstrMessageEvent):
@@ -1685,13 +2368,84 @@ class XWDrawPlugin(Star):
         if len(parts) < 2:
             yield event.plain_result("用法：服装预览 <服装名称>")
             return
+        name = parts[1].strip()
         try:
-            data, _ctype = await self._api().costume_image(parts[1].strip())
-            decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
+            data, _ctype = await self._api().costume_image(name)
+            decision = await self.review_local_image(data, event)
             if not decision.allowed:
-                yield event.plain_result(await self._review_blocked_text(event, "服装预览", decision))
+                yield event.plain_result(await self._blocked_text(event, "服装预览", decision))
                 return
-            yield await self._send_image_bytes(event, data, "服装预览", parts[1].strip() + ".png")
+            yield await self._send_image_bytes(event, data, f"服装预览 · {name}", name + ".png")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    # =======================================================================
+    # 指令：Bot 管理员
+    # =======================================================================
+
+    @filter.command("绘图账号", aliases={"绘图配额", "xw账号"}, prefix_optional=True)
+    async def on_account(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        try:
+            data = await self._api().verify()
+            if not isinstance(data, dict):
+                yield event.plain_result("绘图账号信息\n" + self._format_data(data))
+                return
+            yield event.plain_result(
+                self.render_card(
+                    "👤 绘图账号",
+                    [
+                        ("", [f"备注：{data.get('comment', '—')}"]),
+                        (
+                            "✦ 本地额度",
+                            [f"已用 {data.get('usage')} / {data.get('quota')}", f"剩余 {data.get('remaining')}"],
+                        ),
+                        (
+                            "✦ NAI 额度",
+                            [
+                                f"已用 {data.get('nai_usage')} / {data.get('nai_quota')}",
+                                f"剩余 {data.get('nai_remaining')}",
+                            ],
+                        ),
+                    ],
+                )
+            )
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("绘图版本", aliases={"xw版本", "draw_version"}, prefix_optional=True)
+    async def on_version(self, event: AstrMessageEvent):
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        try:
+            data = await self._api().version()
+            server = data.get("version") if isinstance(data, dict) else data
+            yield event.plain_result(f"插件版本：v{PLUGIN_VERSION}\n服务端版本：{server}\n接口：{self._api().base_url}")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("生成配置", aliases={"绘图配置", "generation_config"}, prefix_optional=True)
+    async def on_generation_config(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        try:
+            data = await self._api().generation_config()
+            yield event.plain_result("生成配置\n" + self._format_data(data))
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
@@ -1706,15 +2460,30 @@ class XWDrawPlugin(Star):
             yield denied
             return
         tokens = event.message_str.strip().split()[1:]
-        if self._has_sensitive_flag(tokens) and not self._is_r18_allowed_session(event):
-            yield self._sensitive_content_denied_result(event)
+        allowance = self._allowance(event)
+        if self._has_sensitive_flag(tokens) and not allowance.r18:
+            yield self._sensitive_denied_result(event, LEVEL_R18, [])
             return
         limit = self._parse_limit(tokens, default=12, max_value=50)
         include_r18 = "--r18" in tokens or "--all" in tokens
         include_r18g = "--r18g" in tokens or "--all" in tokens
         try:
-            data = await self._api().recent_images(limit=limit, exclude_r18=not include_r18, exclude_r18g=not include_r18g)
-            yield event.plain_result(self._format_items(data, "最近图片", limit=limit))
+            data = await self._api().recent_images(
+                limit=limit, exclude_r18=not include_r18, exclude_r18g=not include_r18g
+            )
+            images = data.get("images", []) if isinstance(data, dict) else []
+            rows = []
+            for idx, item in enumerate(images[:limit], 1):
+                marks = ("🔞" if item.get("is_r18") else "") + ("🩸" if item.get("is_r18g") else "")
+                rows.append(f"{idx}. {item.get('date_folder')}/{item.get('filename')} {marks}")
+                rows.append(f"   {self._truncate(item.get('original_input') or item.get('prompt') or '', 90)}")
+            yield event.plain_result(
+                self.render_card(
+                    f"🖼️ 最近图片 · {len(images)}",
+                    [("", rows or ["暂无记录"])],
+                    "图片元数据 <日期>/<文件名> 查看详情",
+                )
+            )
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
@@ -1786,12 +2555,12 @@ class XWDrawPlugin(Star):
             yield denied
             return
         tokens = event.message_str.strip().split()[1:]
-        if self._has_sensitive_flag(tokens) and not self._is_r18_allowed_session(event):
-            yield self._sensitive_content_denied_result(event)
+        if self._has_sensitive_flag(tokens) and not self._allowance(event).r18:
+            yield self._sensitive_denied_result(event, LEVEL_R18, [])
             return
         page = self._parse_limit(tokens, default=1, max_value=999)
         search_tokens = [token for token in tokens if not token.isdigit() and not token.startswith("--")]
-        params = {
+        params: Dict[str, Any] = {
             "page": page,
             "page_size": 10,
             "exclude_r18": str("--r18" not in tokens and "--all" not in tokens).lower(),
@@ -1800,8 +2569,8 @@ class XWDrawPlugin(Star):
         if search_tokens:
             params["search"] = " ".join(search_tokens)
         try:
-            data = await self._api().gallery_json("/gallery/images", params=params)
-            yield event.plain_result(self._format_items(data, "画廊列表", limit=10))
+            data = await self._api().gallery_images(params)
+            yield event.plain_result(self._format_items(data, f"画廊列表 · 第 {page} 页", limit=10))
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
@@ -1816,127 +2585,113 @@ class XWDrawPlugin(Star):
             yield denied
             return
         try:
-            data = await self._api().gallery_json("/gallery/filters")
-            yield event.plain_result("画廊筛选项\n" + self._format_data(data))
+            data = await self._api().gallery_filters()
+            if not isinstance(data, dict):
+                yield event.plain_result("画廊筛选项\n" + self._format_data(data))
+                return
+            dates = data.get("dates", []) or []
+            users = data.get("users", []) or []
+            yield event.plain_result(
+                self.render_card(
+                    "🗂️ 画廊筛选项",
+                    [
+                        ("✦ 日期", [f"共 {len(dates)} 天", "最近：" + "、".join(str(d) for d in dates[:10])]),
+                        ("✦ 用户", [f"共 {len(users)} 个"]),
+                    ],
+                )
+            )
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
 
-    @filter.command("视频生成", aliases={"生成视频", "video_generate"}, prefix_optional=True)
-    async def on_video_generate(self, event: AstrMessageEvent):
-        disabled = self._video_disabled_result(event)
+    @filter.command("画廊删除", aliases={"gallery_delete", "删除图片"}, prefix_optional=True)
+    async def on_gallery_delete(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
         if disabled:
             yield disabled
             return
-        raw = event.message_str.strip()
-        parts = raw.split(maxsplit=1)
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        date_folder, filename = self._extract_image_ref(event.message_str)
+        if not date_folder or not filename:
+            yield event.plain_result("用法：画廊删除 <日期>/<文件名>\n注意：删除不可撤销。")
+            return
+        try:
+            data = await self._api().gallery_delete_image(date_folder, filename)
+            yield event.plain_result(f"已删除 {date_folder}/{filename}\n{self._format_data(data, 400)}")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("我的预设", aliases={"自定义预设", "mypresets"}, prefix_optional=True)
+    async def on_my_presets(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        try:
+            data = await self._api().user_presets()
+            presets = data.get("user_presets", {}) if isinstance(data, dict) else {}
+            rows = [
+                f"{idx}. {name}　{self._truncate((info or {}).get('content', ''), 60)}"
+                for idx, (name, info) in enumerate(list(presets.items())[:30], 1)
+            ]
+            yield event.plain_result(
+                self.render_card(f"📝 我的预设 · {len(presets)}", [("", rows or ["暂无自定义预设"])])
+            )
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("添加预设", aliases={"新建预设", "addpreset"}, prefix_optional=True)
+    async def on_add_preset(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        parts = event.message_str.strip().split(maxsplit=1)
+        if len(parts) < 2 or "|" not in parts[1]:
+            yield event.plain_result("用法：添加预设 <名称>|<内容>")
+            return
+        preset_name, preset_content = [part.strip() for part in parts[1].split("|", 1)]
+        if not preset_name or not preset_content:
+            yield event.plain_result("名称和内容不能为空。")
+            return
+        try:
+            result = await self._api().add_user_preset(preset_name, preset_content)
+            await self._get_presets(force_refresh=True)
+            yield event.plain_result(result.get("message", "预设添加成功") if isinstance(result, dict) else "预设添加成功")
+        except Exception as exc:
+            yield await self._handle_api_error(event, exc)
+
+    @filter.command("删除预设", aliases={"移除预设", "delpreset"}, prefix_optional=True)
+    async def on_delete_preset(self, event: AstrMessageEvent):
+        disabled = self._disabled_result(event)
+        if disabled:
+            yield disabled
+            return
+        denied = await self._admin_only_result(event)
+        if denied:
+            yield denied
+            return
+        parts = event.message_str.strip().split(maxsplit=1)
         if len(parts) < 2:
-            yield event.plain_result("用法：视频生成 <提示词> [-t 秒] [-fps 帧率] [-n 负面提示词]，并附带图片。")
+            yield event.plain_result("用法：删除预设 <名称>")
             return
-        prompt, duration, fps, negative = self._parse_video_args(parts[1])
-        if not prompt:
-            yield event.plain_result("视频提示词不能为空。")
-            return
+        name = parts[1].strip()
         try:
-            fps_int = int(fps)
-        except Exception:
-            yield event.plain_result("视频 fps 必须是 12 到 24 之间的整数。")
-            return
-        if fps_int < 12 or fps_int > 24:
-            yield event.plain_result("视频 fps 必须是 12 到 24 之间的整数。")
-            return
-        fps = str(fps_int)
-        image_bytes = await self._get_image_from_event(event, self._int_conf("timeout", 60))
-        if not image_bytes:
-            yield event.plain_result("视频生成需要附带一张起始图片。")
-            return
-        decision = await self._review_input_image(image_bytes, event)
-        if not decision.allowed:
-            yield event.plain_result(await self._review_blocked_text(event, "起始图片", decision))
-            return
-        try:
-            yield event.plain_result("收到视频生成请求，正在提交任务。")
-            data = await self._api().video_generate(image_bytes, prompt, negative_prompt=negative, duration=duration, fps=fps)
-            yield event.plain_result(self._format_video_submit_result(data))
+            await self._api().delete_user_preset(name)
+            await self._get_presets(force_refresh=True)
+            yield event.plain_result(f"预设「{name}」已删除")
         except Exception as exc:
             yield await self._handle_api_error(event, exc)
-
-    @staticmethod
-    def _format_video_submit_result(data: Any) -> str:
-        if not isinstance(data, dict):
-            return "视频任务已提交。"
-        status = data.get("status", "unknown")
-        ts = data.get("timestamp", "")
-        msg = data.get("message", "")
-        parts = ["视频任务已提交"]
-        if status:
-            parts.append(f"状态: {status}")
-        if ts:
-            parts.append(f"时间戳: {ts}")
-        if msg and msg != "Video generation queued":
-            parts.append(msg)
-        return "\n".join(parts)
-
-    @filter.command("视频历史", aliases={"video_history"}, prefix_optional=True)
-    async def on_video_history(self, event: AstrMessageEvent):
-        disabled = self._video_disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        try:
-            data = await self._api().video_history()
-            yield event.plain_result(self._format_items(data, "视频历史", limit=10))
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    async def _handle_video_file(self, event: AstrMessageEvent, kind: str, image_like: bool):
-        disabled = self._video_disabled_result(event)
-        if disabled:
-            yield disabled
-            return
-        denied = await self._admin_only_result(event)
-        if denied:
-            yield denied
-            return
-        parts = event.message_str.strip().split(maxsplit=2)
-        if len(parts) < 3:
-            yield event.plain_result("用法：视频查看/视频缩略图/视频末帧/视频源图 <timestamp> <username>")
-            return
-        try:
-            data, content_type = await self._api().video_file(parts[1], parts[2], kind=kind)
-            if image_like:
-                decision = await self._review_generated_asset(GeneratedAsset(image_bytes=data), event)
-                if not decision.allowed:
-                    yield event.plain_result(await self._review_blocked_text(event, "图片", decision))
-                    return
-                yield await self._send_image_bytes(event, data, f"{kind} 获取成功", f"{parts[1]}_{kind}.png")
-            else:
-                yield await self._send_file_bytes(event, data, f"{parts[1]}_{parts[2]}.mp4", content_type)
-        except Exception as exc:
-            yield await self._handle_api_error(event, exc)
-
-    @filter.command("视频查看", aliases={"video_get"}, prefix_optional=True)
-    async def on_video_get(self, event: AstrMessageEvent):
-        async for result in self._handle_video_file(event, "video", False):
-            yield result
-
-    @filter.command("视频缩略图", aliases={"video_thumbnail"}, prefix_optional=True)
-    async def on_video_thumbnail(self, event: AstrMessageEvent):
-        async for result in self._handle_video_file(event, "thumbnail", True):
-            yield result
-
-    @filter.command("视频末帧", aliases={"video_last_frame"}, prefix_optional=True)
-    async def on_video_last_frame(self, event: AstrMessageEvent):
-        async for result in self._handle_video_file(event, "last-frame", True):
-            yield result
-
-    @filter.command("视频源图", aliases={"video_source_image"}, prefix_optional=True)
-    async def on_video_source_image(self, event: AstrMessageEvent):
-        async for result in self._handle_video_file(event, "source-image", True):
-            yield result
 
     @filter.command("绘图文档", aliases={"xw文档", "drawing_doc"}, prefix_optional=True)
     async def on_document(self, event: AstrMessageEvent):
@@ -1949,16 +2704,28 @@ class XWDrawPlugin(Star):
             yield denied
             return
         parts = event.message_str.strip().split(maxsplit=1)
+        listing = self.render_card(
+            "📚 绘图文档",
+            [("", [f"{idx}. {name}　{desc}" for idx, (name, desc, _) in enumerate(DOCUMENTS, 1)])],
+            "绘图文档 <名称或序号>",
+        )
         if len(parts) < 2:
-            yield event.plain_result("用法：绘图文档 <名称>")
+            yield event.plain_result(listing)
             return
+
         doc_name = parts[1].strip()
+        if doc_name.isdigit() and 1 <= int(doc_name) <= len(DOCUMENTS):
+            doc_name = DOCUMENT_NAMES[int(doc_name) - 1]
+        entry = next((item for item in DOCUMENTS if item[0] == doc_name), None)
+        if entry is None:
+            yield event.plain_result(f"没有名为「{doc_name}」的文档。\n{listing}")
+            return
+        if not entry[2]:
+            yield event.plain_result(f"「{doc_name}」体积过大，不适合直接发送。\n请到 {self._api().base_url}/dictionary.txt 查看。")
+            return
         try:
             data, content_type = await self._api().document(doc_name)
-            if "text" in content_type or doc_name.endswith(".txt"):
-                yield event.plain_result(self._truncate(data.decode("utf-8", errors="replace"), 1800))
-                return
-            suffix = ".docx" if "word" in content_type or "officedocument" in content_type else ".bin"
-            yield await self._send_file_bytes(event, data, doc_name + suffix, content_type)
+            suffix = ".docx" if "officedocument" in content_type else ".bin"
+            yield await self._send_file_bytes(event, data, doc_name + suffix)
         except Exception as exc:
             yield await self._handle_api_error(event, exc)

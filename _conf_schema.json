@@ -8,97 +8,112 @@
     "api_key": {
         "description": "API Key（Bearer Token）",
         "type": "string",
-        "hint": "填写从绘图服务获取的 API Key。请不要把真实 Key 写入仓库。",
+        "hint": "从绘图服务获取的 API Key。必填。请不要把真实 Key 写入仓库或公开分享。",
         "default": ""
     },
     "timeout": {
         "description": "请求超时时间（秒）",
         "type": "int",
-        "hint": "等待远端生成、下载图片、下载视频或文档的最大秒数。",
-        "default": 60
+        "hint": "等待远端生成、下载图片或文档的最大秒数。出图较慢时可以调大到 120。",
+        "default": 90
+    },
+    "edition": {
+        "description": "版本形态",
+        "type": "string",
+        "hint": "shared=共用版（默认全程拦截 R18）；custom=定制版（按下面两个开关默认放行）。",
+        "options": ["shared", "custom"],
+        "default": "shared"
+    },
+    "custom_edition_allow_r18": {
+        "description": "定制版默认放行 R18",
+        "type": "bool",
+        "hint": "仅在 edition=custom 时生效。关闭后定制版也会像共用版一样拦截 R18。",
+        "default": true
+    },
+    "custom_edition_allow_r18g": {
+        "description": "定制版默认放行 R18G",
+        "type": "bool",
+        "hint": "仅在 edition=custom 时生效。R18G 是血腥猎奇内容，默认仍然拦截，请谨慎开启。",
+        "default": false
     },
     "plugin_enabled": {
         "description": "绘图插件默认总开关",
         "type": "bool",
-        "hint": "默认是否启用绘图插件功能。群/会话内通过“绘图开启/绘图关闭”设置后，会优先使用该会话的持久化状态。",
+        "hint": "默认是否启用绘图功能。群内发送「绘图开启/绘图关闭」后，优先使用该会话的持久化状态。",
         "default": true
     },
     "group_admin_can_toggle": {
-        "description": "允许群管理员控制开关",
+        "description": "允许群管理员控制总开关",
         "type": "bool",
-        "hint": "开启后，事件中可识别为群主/管理员/admin/owner 的用户可以在当前群发送“绘图开启/绘图关闭”。",
+        "hint": "开启后，可识别为群主/管理员的用户可以在当前群发送「绘图开启/绘图关闭」。",
         "default": true
     },
     "switch_admin_user_ids": {
         "description": "额外开关管理员用户 ID",
         "type": "string",
-        "hint": "用英文逗号分隔用户 ID。用于平台无法识别群管身份时，允许指定用户控制绘图总开关。",
+        "hint": "英文逗号分隔。用于平台无法识别群管身份时，指定谁可以控制绘图总开关。",
         "default": ""
     },
-    "r18_review_enabled": {
-        "description": "启用图片发送前自审",
-        "type": "bool",
-        "hint": "开启后，所有生成图片和插件主动发送的图片会在发送前检查 R18/R18G/NSFW 信息。",
-        "default": true
-    },
-    "r18_block_r18": {
-        "description": "拦截 R18 图片",
-        "type": "bool",
-        "hint": "服务 metadata 或外部审核判定为 R18 时不发送图片。",
-        "default": true
-    },
-    "r18_block_r18g": {
-        "description": "拦截 R18G 图片",
-        "type": "bool",
-        "hint": "服务 metadata 或外部审核判定为 R18G 时不发送图片。",
-        "default": true
+    "r18_policy": {
+        "description": "R18 审核策略",
+        "type": "string",
+        "hint": "strict=严格(阈值0.80，泳装擦边也拦) / standard=标准(0.90，只拦明确 R18) / loose=宽松(0.97) / off=完全关闭审核。",
+        "options": ["strict", "standard", "loose", "off"],
+        "default": "standard"
     },
     "r18_nsfw_score_threshold": {
-        "description": "NSFW 分数拦截阈值",
+        "description": "自定义 nsfw_score 阈值",
         "type": "float",
-        "hint": "当 metadata.nsfw_score 大于等于该阈值时拦截。默认 0.65。",
-        "default": 0.65
+        "hint": "填 0 表示跟随上面的策略档位。填大于 0 的值则覆盖档位。服务端实测：明确安全 0.00~0.48，泳装擦边 0.68~0.85，明确 R18 0.98~1.00。",
+        "default": 0
     },
-    "r18_fail_without_metadata": {
-        "description": "缺少自审 metadata 时保守拦截",
+    "r18_block_without_score": {
+        "description": "拿不到分数时保守拦截",
         "type": "bool",
-        "hint": "开启后，如果图片没有 nsfw_score/is_r18/is_r18g 等可用自审结果，且外部审核未给出安全结论，则不发送图片。默认开启。",
+        "hint": "开启后，如果既没有 nsfw_score 也没有外部审核结论，就不发送图片。关闭会明显降低安全性。",
         "default": true
     },
-    "r18_allowed_session_ids": {
-        "description": "R18 放行会话列表",
+    "r18_extra_blocklist": {
+        "description": "额外的提示词拦截词",
         "type": "string",
-        "hint": "用英文逗号分隔 unified_msg_origin/session_id。命中的会话会跳过 R18 拦截，默认留空。",
+        "hint": "英文逗号分隔。命中后与内置 R18 词表同等处理，在提交远端之前就拒绝，不消耗额度。",
+        "default": ""
+    },
+    "r18_allowed_session_ids": {
+        "description": "R18 放行会话名单（共用版）",
+        "type": "string",
+        "hint": "英文逗号分隔的 unified_msg_origin。仅共用版下生效；定制版由上面的开关统一控制。也可以直接在群里用「R18开启」。",
         "default": ""
     },
     "external_review_enabled": {
         "description": "启用外部图片审核接口",
         "type": "bool",
-        "hint": "默认关闭。开启后会把生成图 base64 发送到 external_review_api_url，期望返回 safe/r18/r18g/score/reason，或 OpenAI 兼容 chat completions。",
+        "hint": "默认关闭。开启后会把图片发送到 external_review_api_url 做视觉审核，作为服务端分数之外的额外一道关。",
         "default": false
     },
     "external_review_protocol": {
         "description": "外部审核协议",
         "type": "string",
-        "hint": "auto/openai/custom。auto 会在地址为 /v1 或 /chat/completions 时使用 OpenAI 兼容格式。",
+        "hint": "auto 会在地址以 /v1 或 /chat/completions 结尾时使用 OpenAI 兼容格式，否则用自定义 JSON。",
+        "options": ["auto", "openai", "custom"],
         "default": "auto"
     },
     "external_review_api_url": {
         "description": "外部审核 API 地址",
         "type": "string",
-        "hint": "外部审核接口地址。OpenAI 兼容中转站可填写 https://example.com/v1，插件会请求 /chat/completions。",
+        "hint": "OpenAI 兼容中转站填写 https://example.com/v1，插件会请求 /chat/completions。",
         "default": ""
     },
     "external_review_api_key": {
         "description": "外部审核 API Key",
         "type": "string",
-        "hint": "可选。配置后会作为 Bearer Token 发送给外部审核接口。",
+        "hint": "可选。配置后作为 Bearer Token 发送给外部审核接口。",
         "default": ""
     },
     "external_review_model": {
         "description": "外部审核模型名",
         "type": "string",
-        "hint": "可选。会随请求体一起发送，便于 OpenAI 兼容或自定义审核服务选择模型。",
+        "hint": "可选。需要支持视觉输入的模型。留空时 OpenAI 协议下默认使用 gpt-4o-mini。",
         "default": ""
     },
     "external_review_timeout": {
@@ -110,19 +125,19 @@
     "external_review_max_tokens": {
         "description": "外部审核最大输出 Token",
         "type": "int",
-        "hint": "OpenAI 兼容外审请求的 max_tokens，默认 300。",
+        "hint": "OpenAI 兼容外审请求的 max_tokens。",
         "default": 300
     },
     "external_review_fail_closed": {
         "description": "外部审核失败时保守拦截",
         "type": "bool",
-        "hint": "开启后，外部审核启用但失败、未配置或无图时会拦截；关闭后只采用服务 metadata 结果。",
+        "hint": "开启后，外部审核启用但失败、未配置、无图或返回内容缺少判定字段时会拦截图片。",
         "default": true
     },
     "test_echo_image_enabled": {
         "description": "测试命令允许回显图片",
         "type": "bool",
-        "hint": "默认关闭，避免“测试来点”绕过图片自审回传敏感图片。开启后回显前仍会执行自审。",
+        "hint": "默认关闭，避免用「测试来点」绕过审核回传敏感图片。开启后回显前仍会执行同一套审核。",
         "default": false
     }
 }
