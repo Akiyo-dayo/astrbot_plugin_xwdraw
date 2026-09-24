@@ -9,7 +9,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import aiohttp
 
@@ -385,18 +385,44 @@ class XWDrawApiClient:
                     )
                 return body, resp.headers.get("Content-Type", "")
 
+    def _is_service_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            base = urlparse(self.base_url)
+            default_ports = {"http": 80, "https": 443}
+            return (
+                parsed.scheme in default_ports
+                and parsed.scheme == base.scheme
+                and parsed.hostname == base.hostname
+                and (parsed.port or default_ports[parsed.scheme]) == (base.port or default_ports[base.scheme])
+                and parsed.username is None
+                and parsed.password is None
+            )
+        except (ValueError, KeyError):
+            return False
+
     async def fetch_url_bytes(self, url: str, *, auth: bool = False) -> bytes:
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        req_headers = self._auth_headers(auth=auth) if auth else {}
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=req_headers) as resp:
-                body = await resp.read()
-                if resp.status >= 400:
-                    text = body.decode("utf-8", errors="replace")
-                    raise XWDrawApiError(
-                        self._error_message(self._decode_json_text(text), text, resp.status), resp.status
-                    )
-                return body
+            for _ in range(6):
+                req_headers = self._auth_headers(auth=auth and self._is_service_url(url))
+                async with session.get(url, headers=req_headers, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            raise XWDrawApiError("图片下载跳转缺少地址", resp.status)
+                        url = urljoin(url, location)
+                        if urlparse(url).scheme not in ("http", "https"):
+                            raise XWDrawApiError("图片下载跳转地址无效", resp.status)
+                        continue
+                    body = await resp.read()
+                    if resp.status >= 400:
+                        text = body.decode("utf-8", errors="replace")
+                        raise XWDrawApiError(
+                            self._error_message(self._decode_json_text(text), text, resp.status), resp.status
+                        )
+                    return body
+        raise XWDrawApiError("图片下载跳转次数过多")
 
     async def download_image(self, filename_or_url: str) -> Optional[bytes]:
         seen = set()
@@ -407,7 +433,7 @@ class XWDrawApiClient:
             try:
                 return await self.fetch_url_bytes(url, auth=True)
             except Exception as exc:
-                logger.debug(f"图片下载尝试失败 ({url}): {exc}")
+                logger.debug(f"图片下载尝试失败 ({urlparse(url).hostname or '未知主机'})")
         return None
 
     def _download_attempts(self, filename_or_url: str) -> List[str]:

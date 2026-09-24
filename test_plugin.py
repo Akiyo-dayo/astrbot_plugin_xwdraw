@@ -798,6 +798,8 @@ class ClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         app = web.Application()
         app.router.add_post("/api/generate", self.handle_generate)
         app.router.add_get("/api/image/{date}/{filename}", self.handle_image)
+        app.router.add_get("/api/redirect-image", self.handle_image_redirect)
+        app.router.add_get("/api/redirect-external", self.handle_external_redirect)
         app.router.add_get("/api/image-metadata/{date}/{filename}", self.handle_metadata)
         app.router.add_get("/gallery/filters", self.handle_gallery_filters)
         self.runner = web.AppRunner(app)
@@ -826,7 +828,14 @@ class ClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def handle_image(self, request):
         self.assertEqual(request.match_info["date"], "20260611")
         self.assertEqual(request.match_info["filename"], "test image.png")
+        self.assertEqual(request.headers.get("Authorization"), "Bearer token")
         return web.Response(body=b"fake-png", content_type="image/png")
+
+    async def handle_image_redirect(self, request):
+        raise web.HTTPFound("/api/image/20260611/test%20image.png")
+
+    async def handle_external_redirect(self, request):
+        raise web.HTTPFound(self.external_url)
 
     async def handle_metadata(self, request):
         self.metadata_calls += 1
@@ -851,6 +860,47 @@ class ClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         flat = await client.fetch_score_metadata("20260611", "test image.png")
         self.assertEqual(flat["nsfw_score"], 0.02)
         self.assertGreaterEqual(self.metadata_calls, 2)
+
+    async def test_image_download_preserves_auth_on_service_redirect(self):
+        client = main.XWDrawApiClient(f"{self.base_url}/api/generate", "token", 5)
+        image = await client.download_image(f"{self.base_url}/api/redirect-image")
+        self.assertEqual(image, b"fake-png")
+
+    def test_only_exact_api_origin_can_receive_auth(self):
+        client = main.XWDrawApiClient("https://service.example/api/generate", "token", 5)
+        self.assertTrue(client._is_service_url("https://service.example:443/api/image/test.png"))
+        for url in (
+            "http://service.example/api/image/test.png",
+            "https://service.example:444/api/image/test.png",
+            "https://service.example.attacker.test/api/image/test.png",
+            "https://attacker.test@service.example/api/image/test.png",
+            "https://service.example@attacker.test/api/image/test.png",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(client._is_service_url(url))
+
+    async def test_image_download_never_sends_auth_to_another_origin(self):
+        received_auth = []
+
+        async def handle_external(request):
+            received_auth.append(request.headers.get("Authorization"))
+            return web.Response(body=b"external-png", content_type="image/png")
+
+        app = web.Application()
+        app.router.add_get("/image.png", handle_external)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            host, port = site._server.sockets[0].getsockname()[:2]
+            self.external_url = f"http://{host}:{port}/image.png"
+            client = main.XWDrawApiClient(f"{self.base_url}/api/generate", "token", 5)
+            self.assertEqual(await client.download_image(self.external_url), b"external-png")
+            self.assertEqual(await client.download_image(f"{self.base_url}/api/redirect-external"), b"external-png")
+            self.assertEqual(received_auth, [None, None])
+        finally:
+            await runner.cleanup()
 
     async def test_gallery_uses_bearer_without_a_login_roundtrip(self):
         client = main.XWDrawApiClient(f"{self.base_url}/api/generate", "token", 5)

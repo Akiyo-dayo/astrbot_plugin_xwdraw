@@ -54,6 +54,8 @@ AstrBot 小维绘图插件。对接 [`https://sd.loping151.com`](https://sd.lopi
 | `external_review_*` | 见下 | 可选的外部视觉审核接口 |
 | `test_echo_image_enabled` | `false` | `测试来点` 是否回显输入图 |
 
+API Key 只在 AstrBot 插件配置中填写，不要提交到仓库。下载生成图片时，仅对与 `api_url` 同源的地址发送绘图 Bearer Token；第三方图片地址及跨域跳转不携带该凭据。
+
 ### 从 v0.3.x 升级
 
 - `video_enabled` 及一切视频相关配置已废弃，可以直接删除。
@@ -238,6 +240,10 @@ R18状态 / R18开启 [含G] / R18关闭 / R18跟随
 ```bash
 python test_plugin.py
 ```
+
+## 许可证
+
+MIT，详见 [LICENSE](LICENSE)。
 
 ## 更新日志
 
